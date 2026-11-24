@@ -54,7 +54,9 @@ if errorlevel 1 (
 
 echo.
 echo [2/2] 安装已完成！
-echo 请【新开一个对话窗口】（或重启你的 AI 软件），直接对它说：
-echo     帮我建 PPT 风格工坊
+echo 请【新开一个对话窗口】（或重启你的 AI 软件），先发下面这句做 3 秒验活：
+echo     检查 PPT-style 是否就绪
+echo.
+echo 看到【PPT-style ... 已激活就绪】回复后，再发：帮我建 PPT 风格工坊
 echo.
 pause
