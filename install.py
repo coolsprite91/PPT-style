@@ -144,7 +144,7 @@ def install_skill(
     version = (
         (SKILL_SOURCE / "VERSION").read_text(encoding="utf-8").strip()
         if (SKILL_SOURCE / "VERSION").is_file()
-        else "V0.1.1"
+        else "V0.1.2"
     )
 
     hint_lines = [

@@ -43,6 +43,20 @@ NS = {
 
 EMU_PER_PT = 12700.0
 MEDIA_AV_EXTENSIONS = {".mp4", ".mov", ".avi", ".wmv", ".mkv", ".mp3", ".wav", ".m4a"}
+DIAGRAM_PRST_SHAPES = {
+    "roundRect",
+    "rightArrow",
+    "leftArrow",
+    "downArrow",
+    "upArrow",
+    "chevron",
+    "homePlate",
+    "flowChartProcess",
+    "flowChartDecision",
+    "flowChartTerminator",
+    "bentArrow",
+    "curvedRightArrow",
+}
 DOC_ID_RE = re.compile(r"\[ppt-style-id:([A-Za-z0-9_-]+)\]")
 NUMERIC_TOKEN_RE = re.compile(
     r"(?:[+\-±≥≤><≈]?\s*\d+(?:,\d{3})*(?:\.\d+)?\s*(?:%|‰|个百分点|万元|亿元|万美元|元|万|亿|倍|次|家|户|人|页|项|天|周|月|年|小时|分钟|秒|pt|磅)?)"
@@ -230,6 +244,12 @@ def extract_semantic_slides(pptx_path: Path) -> list[SemanticSlide]:
             for tbl in root.findall(f".//{{{NS['a']}}}tbl"):
                 table_count += 1
                 for tc in tbl.findall(f".//{{{NS['a']}}}tc"):
+                    for rpr in tc.findall(f".//{{{NS['a']}}}rPr"):
+                        if "sz" in rpr.attrib:
+                            try:
+                                font_sizes.add(round(int(rpr.attrib["sz"]) / 100.0 * 2) / 2.0)
+                            except ValueError:
+                                pass
                     ct = _clean_text("".join(t.text or "" for t in tc.findall(f".//{{{NS['a']}}}t")))
                     if ct:
                         table_cells.append(ct)
@@ -253,7 +273,16 @@ def extract_semantic_slides(pptx_path: Path) -> list[SemanticSlide]:
                             notes_parts.append(_clean_text("".join(t.text or "" for t in sp.findall(f".//{{{NS['a']}}}t"))))
                     notes_text = _clean_text(" ".join(p for p in notes_parts if p))
 
-            diagram_shapes = len(root.findall(f".//{{{NS['p']}}}cxnSp")) + len(root.findall(f".//{{{NS['p']}}}grpSp"))
+            auto_diagram_shapes = sum(
+                1
+                for prst in root.findall(f".//{{{NS['p']}}}sp/{{{NS['p']}}}spPr/{{{NS['a']}}}prstGeom")
+                if prst.attrib.get("prst") in DIAGRAM_PRST_SHAPES
+            )
+            diagram_shapes = (
+                len(root.findall(f".//{{{NS['p']}}}cxnSp"))
+                + len(root.findall(f".//{{{NS['p']}}}grpSp"))
+                + auto_diagram_shapes
+            )
             slides.append(
                 SemanticSlide(
                     slide_no=idx,
@@ -292,9 +321,19 @@ def semantic_fingerprint(slides: list[SemanticSlide]) -> str:
 
 
 def _copy_snapshot_file(src: Path, dst: Path) -> bool:
-    """复制底稿到快照库；若文件 >50MB，自动剥离音视频流防止占满系统盘。返回是否执行了媒体剥离。"""
+    """复制底稿到快照库；仅当 >50MB 且实际包含音视频流时执行剥离，避免无谓重压缩高分辨率纯图稿件。"""
     size_mb = src.stat().st_size / (1024 * 1024)
     if size_mb <= 50.0:
+        shutil.copy2(src, dst)
+        return False
+
+    has_av = False
+    with zipfile.ZipFile(src, "r") as zcheck:
+        for item in zcheck.infolist():
+            if item.filename.startswith("ppt/media/") and Path(item.filename).suffix.lower() in MEDIA_AV_EXTENSIONS:
+                has_av = True
+                break
+    if not has_av:
         shutil.copy2(src, dst)
         return False
 

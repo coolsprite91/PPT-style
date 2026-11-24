@@ -421,7 +421,7 @@ def check_file(path_str: str) -> dict[str, Any]:
 
     if header.startswith(OLE_MAGIC) or ext in (".ppt", ".dps"):
         # Check if encrypted or old binary .ppt / .dps
-        label = "老式 .ppt" if ext == ".ppt" else ("WPS 专属 .dps" if ext == ".dps" else "加密或旧版演示文稿")
+        label = "老式 .ppt 格式" if ext == ".ppt" else ("WPS 专属 .dps 格式" if ext == ".dps" else "加密或旧版演示文稿")
         return {
             "path": str(path),
             "name": path.name,
@@ -475,6 +475,7 @@ def check_file(path_str: str) -> dict[str, Any]:
         "size_mb": size_mb,
         "media_av_mb": av_mb,
         "has_heavy_media": size_mb > 50.0 or av_mb > 10.0,
+        "has_av_to_strip": (av_mb > 10.0) or (size_mb > 50.0 and av_mb > 0.0),
         "sha256": _sha256_file(path),
     }
 
@@ -505,10 +506,12 @@ def _box_overlap_ratio(a: tuple[float, float, float, float], b: tuple[float, flo
     return inter / min_area
 
 
-def _get_xfrm_inches(sp_elem: ET.Element) -> tuple[float, float, float, float] | None:
-    xfrm = sp_elem.find(f"./{{{NS['p']}}}spPr/{{{NS['a']}}}xfrm")
+def _get_xfrm_raw_emu(elem: ET.Element) -> tuple[int, int, int, int] | None:
+    xfrm = elem.find(f"./{{{NS['p']}}}spPr/{{{NS['a']}}}xfrm")
     if xfrm is None:
-        xfrm = sp_elem.find(f"./{{{NS['p']}}}xfrm")
+        xfrm = elem.find(f"./{{{NS['p']}}}grpSpPr/{{{NS['a']}}}xfrm")
+    if xfrm is None:
+        xfrm = elem.find(f"./{{{NS['p']}}}xfrm")
     if xfrm is None:
         return None
     off = xfrm.find(f"{{{NS['a']}}}off")
@@ -516,13 +519,114 @@ def _get_xfrm_inches(sp_elem: ET.Element) -> tuple[float, float, float, float] |
     if off is None or ext is None:
         return None
     try:
-        x = int(off.attrib.get("x", "0")) / EMU_PER_INCH
-        y = int(off.attrib.get("y", "0")) / EMU_PER_INCH
-        w = int(ext.attrib.get("cx", "0")) / EMU_PER_INCH
-        h = int(ext.attrib.get("cy", "0")) / EMU_PER_INCH
-        return (x, y, w, h)
+        return (
+            int(off.attrib.get("x", "0")),
+            int(off.attrib.get("y", "0")),
+            int(ext.attrib.get("cx", "0")),
+            int(ext.attrib.get("cy", "0")),
+        )
     except ValueError:
         return None
+
+
+def _get_xfrm_inches(sp_elem: ET.Element) -> tuple[float, float, float, float] | None:
+    raw = _get_xfrm_raw_emu(sp_elem)
+    if raw is None:
+        return None
+    return (
+        raw[0] / EMU_PER_INCH,
+        raw[1] / EMU_PER_INCH,
+        raw[2] / EMU_PER_INCH,
+        raw[3] / EMU_PER_INCH,
+    )
+
+
+def _iter_shapes_with_slide_boxes(
+    sp_tree: ET.Element | None,
+) -> list[tuple[ET.Element, tuple[float, float, float, float] | None, bool]]:
+    """递归展开 <p:grpSp>，把组内相对坐标准确换算成整页英寸绝对坐标。"""
+    if sp_tree is None:
+        return []
+    out: list[tuple[ET.Element, tuple[float, float, float, float] | None, bool]] = []
+    sp_tag = f"{{{NS['p']}}}sp"
+    grp_tag = f"{{{NS['p']}}}grpSp"
+
+    def _walk(
+        container: ET.Element,
+        tx: float,
+        ty: float,
+        sx: float,
+        sy: float,
+        in_group: bool,
+    ) -> None:
+        for child in container:
+            if child.tag == sp_tag:
+                raw = _get_xfrm_raw_emu(child)
+                box = (tx + raw[0] * sx, ty + raw[1] * sy, raw[2] * sx, raw[3] * sy) if raw is not None else None
+                out.append((child, box, in_group))
+            elif child.tag == grp_tag:
+                xfrm = child.find(f"./{{{NS['p']}}}grpSpPr/{{{NS['a']}}}xfrm")
+                ntx, nty, nsx, nsy = tx, ty, sx, sy
+                if xfrm is not None:
+                    off = xfrm.find(f"{{{NS['a']}}}off")
+                    ext = xfrm.find(f"{{{NS['a']}}}ext")
+                    choff = xfrm.find(f"{{{NS['a']}}}chOff")
+                    chext = xfrm.find(f"{{{NS['a']}}}chExt")
+                    if off is not None and ext is not None and choff is not None and chext is not None:
+                        try:
+                            gx = int(off.attrib.get("x", "0"))
+                            gy = int(off.attrib.get("y", "0"))
+                            gcw = int(ext.attrib.get("cx", "0"))
+                            gch = int(ext.attrib.get("cy", "0"))
+                            chx = int(choff.attrib.get("x", "0"))
+                            chy = int(choff.attrib.get("y", "0"))
+                            chcw = int(chext.attrib.get("cx", "0"))
+                            chch = int(chext.attrib.get("cy", "0"))
+                            if chcw > 0 and chch > 0:
+                                nsx = sx * (gcw / chcw)
+                                nsy = sy * (gch / chch)
+                                ntx = tx + gx * sx - chx * nsx
+                                nty = ty + gy * sy - chy * nsy
+                        except ValueError:
+                            pass
+                _walk(child, ntx, nty, nsx, nsy, True)
+
+    _walk(sp_tree, 0.0, 0.0, 1.0 / EMU_PER_INCH, 1.0 / EMU_PER_INCH, False)
+    return out
+
+
+def _resolve_bg_info(
+    root_elem: ET.Element | None,
+    clr_map: dict[str, str],
+    theme_colors: dict[str, str],
+) -> tuple[str | None, str]:
+    """解析单页、版式或母版自身的背景（纯色 / 渐变 / 底图 / 主题引用）。"""
+    if root_elem is None:
+        return (None, "none")
+    bg_el = root_elem.find(f"./{{{NS['p']}}}cSld/{{{NS['p']}}}bg")
+    if bg_el is None:
+        return (None, "none")
+
+    bg_pr = bg_el.find(f"{{{NS['p']}}}bgPr")
+    if bg_pr is not None:
+        solid = bg_pr.find(f"{{{NS['a']}}}solidFill")
+        if solid is not None:
+            return (_resolve_color_elem(solid, clr_map, theme_colors), "solid")
+        grad = bg_pr.find(f"{{{NS['a']}}}gradFill")
+        if grad is not None:
+            gs = grad.find(f".//{{{NS['a']}}}gs")
+            col = _resolve_color_elem(gs, clr_map, theme_colors) if gs is not None else None
+            return (col, "gradient")
+        blip = bg_pr.find(f"{{{NS['a']}}}blipFill")
+        if blip is not None:
+            return (None, "image")
+
+    bg_ref = bg_el.find(f"{{{NS['p']}}}bgRef")
+    if bg_ref is not None:
+        col = _resolve_color_elem(bg_ref, clr_map, theme_colors)
+        return (col, "bgRef")
+
+    return (None, "none")
 
 
 def _is_conclusion_title(title: str) -> bool:
@@ -558,8 +662,14 @@ def inspect_deck(path_str: str, selected_slides: set[int] | None = None) -> dict
                 slide_paths.append(pres_rels[rid][1])
 
         theme_cache: dict[str, dict[str, Any]] = {}
-        master_cache: dict[str, tuple[dict[str, str], dict[str, Any], dict[str, dict[str, Any]]]] = {}
-        layout_cache: dict[str, tuple[str, dict[str, dict[str, Any]]]] = {}
+        master_cache: dict[
+            str,
+            tuple[dict[str, str], dict[str, Any], dict[str, dict[str, Any]], tuple[str | None, str]],
+        ] = {}
+        layout_cache: dict[
+            str,
+            tuple[str, dict[str, dict[str, Any]], tuple[str | None, str]],
+        ] = {}
 
         for idx, sld_path in enumerate(slide_paths, 1):
             sld_root = _read_xml(zf, sld_path)
@@ -586,6 +696,8 @@ def inspect_deck(path_str: str, selected_slides: set[int] | None = None) -> dict
             theme: dict[str, Any] = {"colors": {}, "fonts": {}}
             master_ph_styles: dict[str, dict[str, Any]] = {}
             layout_ph_styles: dict[str, dict[str, Any]] = {}
+            m_bg_info: tuple[str | None, str] = (None, "none")
+            l_bg_info: tuple[str | None, str] = (None, "none")
 
             if layout_path:
                 if layout_path not in layout_cache:
@@ -602,29 +714,22 @@ def inspect_deck(path_str: str, selected_slides: set[int] | None = None) -> dict
                         cmap_el = m_xml.find(f"{{{NS['p']}}}clrMap") if m_xml is not None else None
                         cmap = dict(cmap_el.attrib) if cmap_el is not None else {}
                         m_styles = _collect_placeholder_styles(m_xml, cmap, t_data)
-                        master_cache[m_path] = (cmap, t_data, m_styles)
+                        m_bg = _resolve_bg_info(m_xml, cmap, t_data["colors"])
+                        master_cache[m_path] = (cmap, t_data, m_styles, m_bg)
                     if m_path in master_cache:
-                        cmap, t_data, _ = master_cache[m_path]
+                        cmap, t_data, _, _ = master_cache[m_path]
                         l_styles = _collect_placeholder_styles(lay_xml, cmap, t_data)
+                        l_bg = _resolve_bg_info(lay_xml, cmap, t_data["colors"])
                     else:
                         l_styles = {}
-                    layout_cache[layout_path] = (m_path, l_styles)
+                        l_bg = (None, "none")
+                    layout_cache[layout_path] = (m_path, l_styles, l_bg)
 
-                master_path, layout_ph_styles = layout_cache[layout_path]
+                master_path, layout_ph_styles, l_bg_info = layout_cache[layout_path]
                 if master_path in master_cache:
-                    clr_map, theme, master_ph_styles = master_cache[master_path]
+                    clr_map, theme, master_ph_styles, m_bg_info = master_cache[master_path]
 
-            # Slide background color
-            bg_hex: str | None = None
-            bg_el = sld_root.find(f".//{{{NS['p']}}}bg/{{{NS['p']}}}bgPr/{{{NS['a']}}}solidFill")
-            if bg_el is not None:
-                bg_hex = _resolve_color_elem(bg_el, clr_map, theme["colors"])
-            if not bg_hex:
-                bg_hex = clr_map.get("bg1") and theme["colors"].get(clr_map["bg1"], "FFFFFF") or theme["colors"].get("lt1", "FFFFFF")
-            is_dark_bg = False
-            if bg_hex:
-                r, g, b = int(bg_hex[0:2], 16), int(bg_hex[2:4], 16), int(bg_hex[4:6], 16)
-                is_dark_bg = (0.299 * r + 0.587 * g + 0.114 * b) < 128
+            canvas_scale = max(slide_w_in / 13.333, 0.25)
 
             title_text = ""
             body_texts: list[str] = []
@@ -643,13 +748,20 @@ def inspect_deck(path_str: str, selected_slides: set[int] | None = None) -> dict
             hygiene_issues: list[str] = []
             ph_types_present: set[str] = set()
 
-            for sp in sld_root.findall(f".//{{{NS['p']}}}sp"):
+            sp_tree = sld_root.find(f"./{{{NS['p']}}}cSld/{{{NS['p']}}}spTree")
+            shape_entries = _iter_shapes_with_slide_boxes(sp_tree)
+            if not shape_entries:
+                shape_entries = [
+                    (sp, _get_xfrm_inches(sp), False)
+                    for sp in sld_root.findall(f".//{{{NS['p']}}}sp")
+                ]
+
+            for sp, box, in_group in shape_entries:
                 ph = sp.find(f".//{{{NS['p']}}}ph")
                 ph_type = ph.attrib.get("type", "") if ph is not None else ""
                 if ph_type:
                     ph_types_present.add(ph_type)
                 is_footer = ph_type in ("ftr", "sldNum", "dt")
-                box = _get_xfrm_inches(sp)
                 if box and box[1] > slide_h_in * 0.88 and box[3] < slide_h_in * 0.14:
                     is_footer = True
 
@@ -684,16 +796,17 @@ def inspect_deck(path_str: str, selected_slides: set[int] | None = None) -> dict
                         fn = r_style.get("font")
                         col = r_style.get("color")
                         if not sz and not is_footer:
-                            sz = 18.0 if is_title_shape else 14.0
-                        if is_title_shape or (box and box[1] < slide_h_in * 0.22 and sz and sz >= 18.0 and not title_text):
-                            if sz:
-                                title_sizes.append(sz)
+                            sz = (18.0 if is_title_shape else 14.0) * canvas_scale
+                        norm_sz = round(sz / canvas_scale, 1) if sz else None
+                        if is_title_shape or (box and box[1] < slide_h_in * 0.22 and norm_sz and norm_sz >= 18.0 and not title_text):
+                            if norm_sz:
+                                title_sizes.append(norm_sz)
                             if fn:
                                 title_fonts.append(fn)
                         elif not is_footer:
-                            if sz:
-                                body_sizes.append(sz)
-                                if sz < 10.0:
+                            if norm_sz:
+                                body_sizes.append(norm_sz)
+                                if norm_sz < 10.0:
                                     hygiene_issues.append("small_body_font")
                             if fn:
                                 body_fonts.append(fn)
@@ -705,22 +818,39 @@ def inspect_deck(path_str: str, selected_slides: set[int] | None = None) -> dict
                         para_texts.append(joined_p)
 
                 full_sp_text = " ".join(para_texts).strip()
+                norm_sp = _norm_text(full_sp_text)
                 if full_sp_text and not is_footer:
                     if is_title_shape and not title_text:
-                        title_text = full_sp_text
-                    elif not title_text and box and box[1] < slide_h_in * 0.24 and len(full_sp_text) <= 80:
+                        if len(norm_sp) >= 2 or not norm_sp:
+                            title_text = full_sp_text
+                        else:
+                            body_texts.append(full_sp_text)
+                    elif (
+                        not title_text
+                        and box
+                        and box[1] < slide_h_in * 0.24
+                        and len(full_sp_text) <= 80
+                        and len(norm_sp) >= 2
+                        and not re.fullmatch(r"\d+", norm_sp)
+                    ):
                         title_text = full_sp_text
                     else:
                         body_texts.append(full_sp_text)
 
-                    if box and box[2] < slide_w_in * 0.96 and box[3] < slide_h_in * 0.92:
-                        if box[0] < 0.25 or (box[0] + box[2]) > (slide_w_in - 0.25) or box[1] < 0.20 or (box[1] + box[3]) > (slide_h_in - 0.20):
+                    if (not in_group) and box and box[2] < slide_w_in * 0.95 and box[3] < slide_h_in * 0.90:
+                        if len(norm_sp) >= 3 and (
+                            box[0] < 0.20 * canvas_scale
+                            or (box[0] + box[2]) > (slide_w_in - 0.20 * canvas_scale)
+                            or box[1] < 0.15 * canvas_scale
+                            or (box[1] + box[3]) > (slide_h_in - 0.15 * canvas_scale)
+                        ):
                             hygiene_issues.append("edge_overflow")
-                        for prev_box in non_footer_boxes:
-                            if _box_overlap_ratio(box, prev_box) > 0.15:
-                                hygiene_issues.append("text_box_overlap")
-                                break
-                        non_footer_boxes.append(box)
+                        if len(norm_sp) >= 4:
+                            for prev_box in non_footer_boxes:
+                                if _box_overlap_ratio(box, prev_box) > 0.20:
+                                    hygiene_issues.append("text_box_overlap")
+                                    break
+                            non_footer_boxes.append(box)
 
             # Tables
             for tbl in sld_root.findall(f".//{{{NS['a']}}}tbl"):
@@ -739,13 +869,47 @@ def inspect_deck(path_str: str, selected_slides: set[int] | None = None) -> dict
                         body_texts.append(cell_txt)
 
             # Pictures
+            has_full_bleed_pic = False
             for pic in sld_root.findall(f".//{{{NS['p']}}}pic"):
                 box = _get_xfrm_inches(pic)
                 if box and box[2] >= slide_w_in * 0.95 and box[3] >= slide_h_in * 0.95:
+                    has_full_bleed_pic = True
                     continue  # skip full-bleed background picture
                 pic_count += 1
                 if box:
                     pic_area += box[2] * box[3]
+
+            # Inherited slide background resolution: slide -> layout -> master -> full-bleed pic -> theme
+            s_bg_hex, s_bg_kind = _resolve_bg_info(sld_root, clr_map, theme["colors"])
+            bg_hex: str | None = None
+            bg_kind = "none"
+            for cand_hex, cand_kind in ((s_bg_hex, s_bg_kind), l_bg_info, m_bg_info):
+                if cand_kind != "none":
+                    bg_hex, bg_kind = cand_hex, cand_kind
+                    break
+
+            if (
+                bg_kind == "none"
+                or (s_bg_kind == "none" and l_bg_info[1] == "none" and bg_kind == "bgRef" and (bg_hex or "FFFFFF") == "FFFFFF")
+            ) and has_full_bleed_pic:
+                bg_kind = "image"
+                bg_hex = None
+            elif bg_kind == "none":
+                bg_hex = (
+                    (clr_map.get("bg1") and theme["colors"].get(clr_map["bg1"]))
+                    or theme["colors"].get("lt1")
+                    or "FFFFFF"
+                )
+                bg_kind = "theme_default"
+
+            is_dark_bg = False
+            if bg_kind == "image" and bg_hex is None:
+                bg_color_cn = "底图背景"
+            else:
+                eff_hex = bg_hex or "FFFFFF"
+                bg_color_cn = rgb_to_cn_name(eff_hex)
+                r, g, b = int(eff_hex[0:2], 16), int(eff_hex[2:4], 16), int(eff_hex[4:6], 16)
+                is_dark_bg = (0.299 * r + 0.587 * g + 0.114 * b) < 128
 
             # Charts
             chart_kinds: list[str] = []
@@ -796,7 +960,8 @@ def inspect_deck(path_str: str, selected_slides: set[int] | None = None) -> dict
                 "page_role": page_role,
                 "master_path": master_path,
                 "layout_path": layout_path,
-                "bg_color_cn": rgb_to_cn_name(bg_hex) if bg_hex else "纯白",
+                "bg_color_cn": bg_color_cn,
+                "bg_kind": bg_kind,
                 "is_dark_bg": is_dark_bg,
                 "title": title_text,
                 "snippet": _clean_text(" ".join(body_texts))[:60],
@@ -949,6 +1114,12 @@ def scan_corpus(deck_specs: list[dict[str, Any]]) -> dict[str, Any]:
     table_hdr_cn = Counter(c for _fn, _c, _m, s in active_slides for c in s["table_header_colors_cn"])
     accent_cn = Counter(c for _fn, _c, _m, s in active_slides for c in s["accent_colors_cn"])
     bg_cn = Counter(s["bg_color_cn"] for _fn, _c, _m, s in active_slides)
+    bg_kinds = Counter(s.get("bg_kind", "solid") for _fn, _c, _m, s in active_slides)
+    canvas_sizes = Counter(
+        f"{d['slide_size_in'][0]}x{d['slide_size_in'][1]}"
+        for d in valid_decks
+        if d["file"] not in ignored_files and "slide_size_in" in d
+    )
     chart_kinds = Counter(ck for _fn, _c, _m, s in active_slides for ck in s["chart_kinds"])
     table_slides = [s for _fn, _c, _m, s in active_slides if s["table_count"] > 0]
     diagram_slides = [s for _fn, _c, _m, s in active_slides if s["vector_diagram_signals"] >= 2 or s["has_smartart"]]
@@ -1012,6 +1183,8 @@ def scan_corpus(deck_specs: list[dict[str, Any]]) -> dict[str, Any]:
             "median_title_size_pt": round(statistics.median(title_sizes_all), 1) if title_sizes_all else 22.0,
             "median_body_size_pt": round(statistics.median(body_sizes_all), 1) if body_sizes_all else 14.0,
             "dominant_bg_color_cn": bg_cn.most_common(1)[0][0] if bg_cn else "纯白",
+            "bg_kind_counts": dict(bg_kinds),
+            "canvas_sizes": dict(canvas_sizes),
             "top_accent_colors_cn": [c for c, _ in accent_cn.most_common(3)],
             "top_table_header_color_cn": table_hdr_cn.most_common(1)[0][0] if table_hdr_cn else "",
             "carrier_counts": {

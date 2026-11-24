@@ -164,6 +164,49 @@ def _check_blueprint_overflow(blueprint: dict[str, Any]) -> list[dict[str, Any]]
     return overflows
 
 
+def _select_blank_layout(prs: Any) -> Any:
+    """智能挑选真正的空白版式（规避第 7 个槽位被重排为图片/标题版式的企业模板陷阱）。"""
+    layouts = list(prs.slide_layouts)
+    if not layouts:
+        raise ValueError("当前演示文稿缺少可用版式")
+
+    def _is_blank_name(name: str) -> bool:
+        low = (name or "").strip().lower()
+        has_blank = ("blank" in low) or ("空白" in low)
+        has_content_word = any(k in low for k in ("标题", "图片", "内容", "title", "pic", "content"))
+        return has_blank and not has_content_word
+
+    def _exact_blank(name: str) -> bool:
+        low = (name or "").strip().lower()
+        return low in ("blank", "空白", "空白页")
+
+    zero_ph = [lay for lay in layouts if len(lay.placeholders) == 0]
+    if zero_ph:
+        return min(
+            zero_ph,
+            key=lambda lay: (0 if _is_blank_name(lay.name) else 1, len(lay.shapes)),
+        )
+
+    named_blank = [lay for lay in layouts if _is_blank_name(lay.name)]
+    if named_blank:
+        return min(
+            named_blank,
+            key=lambda lay: (0 if _exact_blank(lay.name) else 1, len(lay.placeholders), len(lay.shapes)),
+        )
+
+    return min(layouts, key=lambda lay: (len(lay.placeholders), len(lay.shapes)))
+
+
+def _clear_empty_placeholders(slide: Any) -> None:
+    """清除从母版版式继承下来的空占位框，防止叠出现影轮廓。"""
+    for ph in list(slide.placeholders):
+        has_txt = getattr(ph, "has_text_frame", False) and bool(ph.text_frame.text.strip())
+        if not has_txt:
+            sp_el = ph._element
+            if sp_el.getparent() is not None:
+                sp_el.getparent().remove(sp_el)
+
+
 def build_pptx(
     blueprint: dict[str, Any],
     out_path_str: str,
@@ -224,28 +267,43 @@ def build_pptx(
         prs.slide_width = Inches(13.333)
         prs.slide_height = Inches(7.5)
 
-    blank_layout = prs.slide_layouts[6] if len(prs.slide_layouts) > 6 else prs.slide_layouts[-1]
+    slide_w_in = float(prs.slide_width) / 914400.0 if prs.slide_width else 13.333
+    slide_h_in = float(prs.slide_height) / 914400.0 if prs.slide_height else 7.5
+    scale_w = slide_w_in / 13.333
+    scale_h = slide_h_in / 7.5
+    if abs(scale_w - 1.0) < 0.02 and abs(scale_h - 1.0) < 0.02:
+        scale_w, scale_h = 1.0, 1.0
+    font_scale = min(scale_w, scale_h)
+
+    blank_layout = _select_blank_layout(prs)
 
     def _populate_slide(slide: Any, spec: dict[str, Any]) -> None:
+        _clear_empty_placeholders(slide)
+
         # Optional clean background
         if not spec.get("keep_existing_bg", False):
             fill = slide.background.fill
             fill.solid()
             fill.fore_color.rgb = bg_rgb
 
+        margin_l = SAFE_MARGIN_LEFT_IN * scale_w
+        margin_r = SAFE_MARGIN_RIGHT_IN * scale_w
+        margin_t = SAFE_MARGIN_TOP_IN * scale_h
+        content_w = slide_w_in - margin_l - margin_r
+
         # Title + conclusion subtitle
         title_box = slide.shapes.add_textbox(
-            Inches(SAFE_MARGIN_LEFT_IN),
-            Inches(SAFE_MARGIN_TOP_IN),
-            Inches(13.333 - SAFE_MARGIN_LEFT_IN - SAFE_MARGIN_RIGHT_IN),
-            Inches(0.95),
+            Inches(margin_l),
+            Inches(margin_t),
+            Inches(content_w),
+            Inches(0.95 * scale_h),
         )
         tf = title_box.text_frame
         tf.word_wrap = True
         p0 = tf.paragraphs[0]
         p0.text = spec.get("title", "")
         p0.font.name = font_name
-        p0.font.size = Pt(title_pt)
+        p0.font.size = Pt(round(title_pt * font_scale, 1))
         p0.font.bold = True
         p0.font.color.rgb = primary_rgb
 
@@ -253,16 +311,16 @@ def build_pptx(
             p1 = tf.add_paragraph()
             p1.text = spec["subtitle"]
             p1.font.name = font_name
-            p1.font.size = Pt(subtitle_pt)
+            p1.font.size = Pt(round(subtitle_pt * font_scale, 1))
             p1.font.color.rgb = text_rgb
 
         # Divider line
         line_shape = slide.shapes.add_shape(
             MSO_SHAPE.RECTANGLE,
-            Inches(SAFE_MARGIN_LEFT_IN),
-            Inches(1.48),
-            Inches(13.333 - SAFE_MARGIN_LEFT_IN - SAFE_MARGIN_RIGHT_IN),
-            Inches(0.025),
+            Inches(margin_l),
+            Inches(1.48 * scale_h),
+            Inches(content_w),
+            Inches(0.025 * scale_h),
         )
         line_shape.fill.solid()
         line_shape.fill.fore_color.rgb = primary_rgb
@@ -270,16 +328,16 @@ def build_pptx(
 
         blocks = spec.get("blocks", [])
         n_blocks = max(1, len(blocks))
-        gap_in = 0.25
-        total_w = 13.333 - SAFE_MARGIN_LEFT_IN - SAFE_MARGIN_RIGHT_IN
-        col_w = (total_w - gap_in * (n_blocks - 1)) / n_blocks
-        top_y = 1.72
-        area_h = 5.15
+        gap_in = 0.25 * scale_w
+        col_w = (content_w - gap_in * (n_blocks - 1)) / n_blocks
+        top_y = 1.72 * scale_h
+        area_h = 5.15 * scale_h
 
         for idx, blk in enumerate(blocks):
-            left_x = SAFE_MARGIN_LEFT_IN + idx * (col_w + gap_in)
+            left_x = margin_l + idx * (col_w + gap_in)
             btype = blk.get("type", "bullets")
-            eff_pt = max(10.5, body_pt - 1.5) if force_shrink else float(blk.get("font_size_pt", body_pt))
+            raw_eff_pt = max(10.5, body_pt - 1.5) if force_shrink else float(blk.get("font_size_pt", body_pt))
+            eff_pt = round(raw_eff_pt * font_scale, 1)
 
             if btype in ("bullets", "text", "card"):
                 if btype == "card":
@@ -295,10 +353,10 @@ def build_pptx(
                     bg_card.line.color.rgb = RGBColor(210, 218, 228)
                     bg_card.line.width = Pt(1)
                 tb = slide.shapes.add_textbox(
-                    Inches(left_x + 0.1),
-                    Inches(top_y + 0.1),
-                    Inches(col_w - 0.2),
-                    Inches(area_h - 0.2),
+                    Inches(left_x + 0.1 * scale_w),
+                    Inches(top_y + 0.1 * scale_h),
+                    Inches(col_w - 0.2 * scale_w),
+                    Inches(area_h - 0.2 * scale_h),
                 )
                 btf = tb.text_frame
                 btf.word_wrap = True
@@ -306,7 +364,7 @@ def build_pptx(
                     hp = btf.paragraphs[0]
                     hp.text = blk["heading"]
                     hp.font.name = font_name
-                    hp.font.size = Pt(eff_pt + 2)
+                    hp.font.size = Pt(round(eff_pt + 2 * font_scale, 1))
                     hp.font.bold = True
                     hp.font.color.rgb = primary_rgb
                     first = False
@@ -321,7 +379,7 @@ def build_pptx(
                     p.font.name = font_name
                     p.font.size = Pt(eff_pt)
                     p.font.color.rgb = text_rgb
-                    p.space_after = Pt(6)
+                    p.space_after = Pt(round(6 * font_scale, 1))
 
             elif btype == "table":
                 headers = blk.get("headers", [])
@@ -336,7 +394,7 @@ def build_pptx(
                         Inches(left_x),
                         Inches(top_y),
                         Inches(col_w),
-                        Inches(min(area_h, 0.48 * n_r + 0.3)),
+                        Inches(min(area_h, (0.48 * n_r + 0.3) * scale_h)),
                     )
                     tbl = tbl_shape.table
                     for r_i, row in enumerate(all_rows):
@@ -347,7 +405,7 @@ def build_pptx(
                             cell.text = val
                             p = cell.text_frame.paragraphs[0]
                             p.font.name = font_name
-                            p.font.size = Pt(max(10.5, eff_pt - 1))
+                            p.font.size = Pt(round(max(10.5 * font_scale, eff_pt - 1 * font_scale), 1))
                             if r_i == 0 and headers:
                                 cell.fill.solid()
                                 cell.fill.fore_color.rgb = primary_rgb
@@ -362,10 +420,10 @@ def build_pptx(
                 steps = blk.get("steps", [])
                 if steps:
                     step_n = len(steps)
-                    arrow_w = 0.28
+                    arrow_w = 0.28 * scale_w
                     box_w = (col_w - arrow_w * (step_n - 1)) / step_n
-                    box_h = 1.45
-                    box_y = top_y + 0.6
+                    box_h = 1.45 * scale_h
+                    box_y = top_y + 0.6 * scale_h
                     for s_i, step_label in enumerate(steps):
                         sx = left_x + s_i * (box_w + arrow_w)
                         shp = slide.shapes.add_shape(
@@ -389,10 +447,10 @@ def build_pptx(
                         if s_i < step_n - 1:
                             arr = slide.shapes.add_shape(
                                 MSO_SHAPE.RIGHT_ARROW,
-                                Inches(sx + box_w + 0.04),
-                                Inches(box_y + box_h / 2 - 0.12),
-                                Inches(arrow_w - 0.08),
-                                Inches(0.24),
+                                Inches(sx + box_w + 0.04 * scale_w),
+                                Inches(box_y + box_h / 2 - 0.12 * scale_h),
+                                Inches(max(0.05 * scale_w, arrow_w - 0.08 * scale_w)),
+                                Inches(0.24 * scale_h),
                             )
                             arr.fill.solid()
                             arr.fill.fore_color.rgb = accent_rgb

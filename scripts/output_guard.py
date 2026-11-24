@@ -38,8 +38,16 @@ QUESTION_COUNT_RE = re.compile(
     r"(?:共\s*\d+\s*[个道项轮]|还有\s*\d+\s*[个道项]|\d+\s*[个道项]\s*(?:问题|确认项|待补充|小习惯))"
 )
 
-CONCRETE_DATE_RE = re.compile(r"\b20\d{2}\s*[年\-/\.]\s*\d{1,2}(?:\s*[月\-/\.]\s*\d{1,2}日?)?")
-CONCRETE_METRIC_RE = re.compile(r"\b\d+(?:\.\d+)?\s*(?:%|个百分点|万元|亿元|元|万家|万户|家|台|人|小时|分钟|秒)\b")
+CONCRETE_DATE_RE = re.compile(
+    r"(?<![0-9])(?:19|20)\d{2}\s*(?:"
+    r"年\s*\d{1,2}\s*月(?:\s*\d{1,2}\s*[日号]?)?"
+    r"|年"
+    r"|[\-/\.]\s*\d{1,2}(?:[\-/\.]\s*\d{1,2})?"
+    r")"
+)
+CONCRETE_METRIC_RE = re.compile(
+    r"(?<![0-9A-Za-z\.])\d+(?:,\d{3})*(?:\.\d+)?\s*(?:%|‰|个百分点|万元|亿元|万美元|元|万家|万户|家|台|人|小时|分钟|秒)(?![A-Za-z])"
+)
 
 
 def check_reply_text(text: str, expect_questions: int | None = None) -> dict[str, Any]:
