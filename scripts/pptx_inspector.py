@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import colorsys
 import hashlib
+import importlib.util
 import json
 import re
 import statistics
@@ -37,6 +38,8 @@ NS = {
     "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
     "rel": "http://schemas.openxmlformats.org/package/2006/relationships",
     "c": "http://schemas.openxmlformats.org/drawingml/2006/chart",
+    "dc": "http://purl.org/dc/elements/1.1/",
+    "cp": "http://schemas.openxmlformats.org/package/2006/metadata/core-properties",
 }
 
 EMU_PER_INCH = 914400.0
@@ -46,6 +49,9 @@ ZIP_MAGIC = b"PK\x03\x04"
 PDF_MAGIC = b"%PDF"
 IMG_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"}
 MEDIA_AV_EXTENSIONS = {".mp4", ".mov", ".avi", ".wmv", ".mkv", ".mp3", ".wav", ".m4a"}
+TEMPLATE_PLACEHOLDER_RE = re.compile(r"(?:点击添加|单击此处添加|请输入|占位文本|示例文字|示例内容|\bTBD\b|\bTODO\b|Click to add)", re.IGNORECASE)
+COLLAB_FILENAME_RE = re.compile(r"(汇总|月会|月例会|周例会|联合汇报|部门汇报|合并版|汇编|合集|各组)")
+SPEAKER_SIGN_RE = re.compile(r"(?:汇报人|负责人|主讲人|撰写人|Owner)\s*[:：]\s*([\u4e00-\u9fa5A-Za-z0-9_]{2,12})")
 
 
 def _clean_text(text: str) -> str:
@@ -389,14 +395,54 @@ def _collect_placeholder_styles(
 
 
 def check_file(path_str: str) -> dict[str, Any]:
-    """检查文件真实格式头、多媒体体积，返回准入或自助另存指引。"""
+    """检查文件真实格式头、跨软件格式（Keynote/ODP）、企业透明加密与多媒体体积。"""
     path = Path(path_str)
+    ext = path.suffix.lower()
+
+    if path.is_dir() and ext == ".key":
+        return {
+            "path": str(path),
+            "name": path.name,
+            "status": "NEEDS_USER_CONVERT",
+            "format_kind": "keynote",
+            "size_mb": 0.0,
+            "human_hint": (
+                f"《{path.name}》是苹果 Keynote 演示文稿。"
+                "请用 Keynote 打开它，点击菜单栏「文件 → 导出到 → PowerPoint…（选 .pptx）」保存后再发我即可。"
+            ),
+        }
+
     if not path.is_file():
         return {"path": str(path), "status": "MISSING", "human_hint": f"未找到文件：{path.name}"}
 
     size_bytes = path.stat().st_size
     size_mb = round(size_bytes / (1024 * 1024), 2)
-    ext = path.suffix.lower()
+
+    if ext == ".key":
+        return {
+            "path": str(path),
+            "name": path.name,
+            "status": "NEEDS_USER_CONVERT",
+            "format_kind": "keynote",
+            "size_mb": size_mb,
+            "human_hint": (
+                f"《{path.name}》是苹果 Keynote 演示文稿。"
+                "请用 Keynote 打开它，点击「文件 → 导出到 → PowerPoint…（.pptx）」保存后再发我即可。"
+            ),
+        }
+
+    if ext == ".odp":
+        return {
+            "path": str(path),
+            "name": path.name,
+            "status": "NEEDS_USER_CONVERT",
+            "format_kind": "odp",
+            "size_mb": size_mb,
+            "human_hint": (
+                f"《{path.name}》是 LibreOffice/OpenDocument 演示文稿。"
+                "请在软件里点击「文件 → 另存为 → PowerPoint 2007-365 (.pptx)」后再发我。"
+            ),
+        }
 
     with path.open("rb") as fh:
         header = fh.read(16)
@@ -420,12 +466,12 @@ def check_file(path_str: str) -> dict[str, Any]:
         }
 
     if header.startswith(OLE_MAGIC) or ext in (".ppt", ".dps"):
-        # Check if encrypted or old binary .ppt / .dps
         label = "老式 .ppt 格式" if ext == ".ppt" else ("WPS 专属 .dps 格式" if ext == ".dps" else "加密或旧版演示文稿")
         return {
             "path": str(path),
             "name": path.name,
             "status": "NEEDS_USER_CONVERT",
+            "format_kind": ext.lstrip(".") or "ole",
             "size_mb": size_mb,
             "human_hint": (
                 f"《{path.name}》属于{label}格式，直接读取会丢掉样式或提示加密。"
@@ -434,6 +480,18 @@ def check_file(path_str: str) -> dict[str, Any]:
         }
 
     if not header.startswith(ZIP_MAGIC):
+        if ext == ".pptx" and size_bytes >= 1024:
+            return {
+                "path": str(path),
+                "name": path.name,
+                "status": "SUSPECTED_DRM_ENCRYPTED",
+                "suspected_drm": True,
+                "size_mb": size_mb,
+                "human_hint": (
+                    f"《{path.name}》在你电脑软件里也许能正常打开，但底层读取时是加密乱码，大概率是公司装了文件透明加密软件。"
+                    "请在非加密区重新保存一份，或先导出 PDF 发我走纯对话降级模式。"
+                ),
+            }
         return {
             "path": str(path),
             "name": path.name,
@@ -637,14 +695,22 @@ def _is_conclusion_title(title: str) -> bool:
 
 
 def inspect_deck(path_str: str, selected_slides: set[int] | None = None) -> dict[str, Any]:
-    """对单份 .pptx 进行深层结构、主题继承、图表/备注/硬伤扫描。"""
+    """对单份 .pptx 进行深层结构、主题继承、精确色板、多信号合写预分诊与硬伤扫描。"""
     path = Path(path_str)
     chk = check_file(path_str)
     if chk.get("status") != "VALID_PPTX":
         return {"file": path.name, "path": str(path), "error": chk}
 
     slides_data: list[dict[str, Any]] = []
+    metadata: dict[str, str] = {"creator": "", "last_modified_by": ""}
     with zipfile.ZipFile(path, "r") as zf:
+        core_xml = _read_xml(zf, "docProps/core.xml")
+        if core_xml is not None:
+            cr_el = core_xml.find(f"{{{NS['dc']}}}creator")
+            lm_el = core_xml.find(f"{{{NS['cp']}}}lastModifiedBy")
+            metadata["creator"] = _clean_text(cr_el.text) if (cr_el is not None and cr_el.text) else ""
+            metadata["last_modified_by"] = _clean_text(lm_el.text) if (lm_el is not None and lm_el.text) else ""
+
         pres = _read_xml(zf, "ppt/presentation.xml")
         pres_rels = _read_rels(zf, "ppt/presentation.xml")
         if pres is None:
@@ -738,8 +804,12 @@ def inspect_deck(path_str: str, selected_slides: set[int] | None = None) -> dict
             title_sizes: list[float] = []
             body_sizes: list[float] = []
             accent_colors: Counter[str] = Counter()
+            accent_hexes: Counter[str] = Counter()
+            title_color_hexes: Counter[str] = Counter()
+            body_color_hexes: Counter[str] = Counter()
             table_count = 0
             table_header_colors: list[str] = []
+            table_header_hexes: list[str] = []
             pic_count = 0
             pic_area = 0.0
             connector_count = len(sld_root.findall(f".//{{{NS['p']}}}cxnSp"))
@@ -803,6 +873,8 @@ def inspect_deck(path_str: str, selected_slides: set[int] | None = None) -> dict
                                 title_sizes.append(norm_sz)
                             if fn:
                                 title_fonts.append(fn)
+                            if col:
+                                title_color_hexes[col] += 1
                         elif not is_footer:
                             if norm_sz:
                                 body_sizes.append(norm_sz)
@@ -810,8 +882,11 @@ def inspect_deck(path_str: str, selected_slides: set[int] | None = None) -> dict
                                     hygiene_issues.append("small_body_font")
                             if fn:
                                 body_fonts.append(fn)
+                            if col:
+                                body_color_hexes[col] += 1
                         if col and col not in ("FFFFFF", "000000", "333333", "595959"):
                             accent_colors[rgb_to_cn_name(col)] += 1
+                            accent_hexes[col] += 1
 
                     joined_p = _clean_text("".join(runs_txt))
                     if joined_p:
@@ -863,6 +938,7 @@ def inspect_deck(path_str: str, selected_slides: set[int] | None = None) -> dict
                         tc_hex = _resolve_color_elem(fill, clr_map, theme["colors"])
                         if tc_hex:
                             table_header_colors.append(rgb_to_cn_name(tc_hex))
+                            table_header_hexes.append(tc_hex)
                 for tc in tbl.findall(f".//{{{NS['a']}}}tc"):
                     cell_txt = _clean_text("".join(t.text or "" for t in tc.findall(f".//{{{NS['a']}}}t")))
                     if cell_txt:
@@ -930,6 +1006,7 @@ def inspect_deck(path_str: str, selected_slides: set[int] | None = None) -> dict
 
             slide_char_count = len(_clean_text(title_text + " " + " ".join(body_texts)))
             full_text = _clean_text(title_text + " | " + " | ".join(body_texts))
+            speakers = sorted(set(SPEAKER_SIGN_RE.findall(full_text)))
 
             # Classify special page roles (cover / toc / section / closing / content)
             page_role = "content"
@@ -961,11 +1038,13 @@ def inspect_deck(path_str: str, selected_slides: set[int] | None = None) -> dict
                 "master_path": master_path,
                 "layout_path": layout_path,
                 "bg_color_cn": bg_color_cn,
+                "bg_hex": (bg_hex or "FFFFFF") if bg_kind != "image" else "",
                 "bg_kind": bg_kind,
                 "is_dark_bg": is_dark_bg,
                 "title": title_text,
                 "snippet": _clean_text(" ".join(body_texts))[:60],
                 "full_text": full_text,
+                "speakers": speakers,
                 "slide_char_count": slide_char_count,
                 "notes_char_count": notes_chars,
                 "title_fonts": sorted(set(title_fonts)),
@@ -973,8 +1052,12 @@ def inspect_deck(path_str: str, selected_slides: set[int] | None = None) -> dict
                 "title_sizes": sorted(set(title_sizes)),
                 "body_sizes": sorted(set(body_sizes)),
                 "accent_colors_cn": [c for c, _ in accent_colors.most_common(3)],
+                "accent_hexes": [c for c, _ in accent_hexes.most_common(3)],
+                "title_color_hexes": [c for c, _ in title_color_hexes.most_common(2)],
+                "body_color_hexes": [c for c, _ in body_color_hexes.most_common(2)],
                 "table_count": table_count,
                 "table_header_colors_cn": table_header_colors,
+                "table_header_hexes": table_header_hexes,
                 "chart_kinds": chart_kinds,
                 "has_smartart": has_smartart,
                 "vector_diagram_signals": connector_count + group_count,
@@ -1037,15 +1120,184 @@ def inspect_deck(path_str: str, selected_slides: set[int] | None = None) -> dict
                 "samples": [{"slide_no": x["slide_no"], "title": x["title"] or x["snippet"]} for x in chunk[:4]],
             })
 
+    # Theme tokens for this deck
+    deck_title_fonts = Counter(f for s in content_slides for f in s["title_fonts"])
+    deck_body_fonts = Counter(f for s in content_slides for f in s["body_fonts"])
+    deck_title_sizes = [sz for s in content_slides for sz in s["title_sizes"]]
+    deck_body_sizes = [sz for s in content_slides for sz in s["body_sizes"]]
+    deck_tbl_hex = Counter(h for s in content_slides for h in s["table_header_hexes"])
+    deck_title_hex = Counter(h for s in content_slides for h in s["title_color_hexes"])
+    deck_accent_hex = Counter(h for s in content_slides for h in s["accent_hexes"])
+    deck_bg_hex = Counter(s["bg_hex"] for s in content_slides if s["bg_hex"])
+    deck_bg_cn = Counter(s["bg_color_cn"] for s in content_slides)
+    deck_dark_cnt = sum(1 for s in content_slides if s["is_dark_bg"])
+    deck_is_dark = bool(content_slides) and (deck_dark_cnt / len(content_slides)) >= 0.5
+
+    primary_hex = (
+        (deck_tbl_hex.most_common(1)[0][0] if deck_tbl_hex else "")
+        or (deck_title_hex.most_common(1)[0][0] if deck_title_hex else "")
+        or (deck_accent_hex.most_common(1)[0][0] if deck_accent_hex else "")
+        or ("3B82F6" if deck_is_dark else "1F4E79")
+    )
+    accent_hex = next((h for h, _ in deck_accent_hex.most_common(3) if h != primary_hex), "") or "D96B27"
+    bg_hex_val = (deck_bg_hex.most_common(1)[0][0] if deck_bg_hex else "") or ("162238" if deck_is_dark else "FFFFFF")
+    theme_tokens = {
+        "primary_hex": primary_hex,
+        "accent_hex": accent_hex,
+        "bg_hex": bg_hex_val,
+        "text_hex": "EBF0F5" if deck_is_dark else "222222",
+        "table_header_hex": deck_tbl_hex.most_common(1)[0][0] if deck_tbl_hex else primary_hex,
+        "title_font": deck_title_fonts.most_common(1)[0][0] if deck_title_fonts else "Microsoft YaHei",
+        "body_font": deck_body_fonts.most_common(1)[0][0] if deck_body_fonts else "Microsoft YaHei",
+        "title_size_pt": round(statistics.median(deck_title_sizes), 1) if deck_title_sizes else 22.0,
+        "body_size_pt": round(statistics.median(deck_body_sizes), 1) if deck_body_sizes else 14.0,
+        "is_dark_bg": deck_is_dark,
+        "bg_color_cn": deck_bg_cn.most_common(1)[0][0] if deck_bg_cn else "纯白",
+        "primary_color_cn": rgb_to_cn_name(primary_hex),
+    }
+
+    # Multi-signal collaboration / template pre-triage
+    placeholder_hits = sum(1 for s in content_slides if TEMPLATE_PLACEHOLDER_RE.search(s["full_text"]))
+    total_content_chars = sum(s["slide_char_count"] for s in content_slides)
+    all_speakers = sorted({sp for s in slides_data for sp in s.get("speakers", [])})
+    collab_signals: list[str] = []
+
+    if len(master_counts) >= 2:
+        collab_signals.append(f"文件内混用了 {len(master_counts)} 套不同母版")
+    if len(all_speakers) >= 2:
+        collab_signals.append(f"页内出现多位不同汇报人署名（{'、'.join(all_speakers[:4])}）")
+    if COLLAB_FILENAME_RE.search(path.stem) and len(slides_data) >= 6:
+        collab_signals.append("文件名含多人汇总或例会合并特征")
+
+    # Same-master segment style shift check (fonts, table header colors, bg flip, density jump)
+    if len(content_slides) >= 6:
+        mid = len(content_slides) // 2
+        seg_a, seg_b = content_slides[:mid], content_slides[mid:]
+        shift_reasons: list[str] = []
+        fa = Counter(f for s in seg_a for f in s["body_fonts"]).most_common(1)
+        fb = Counter(f for s in seg_b for f in s["body_fonts"]).most_common(1)
+        if fa and fb and fa[0][0] != fb[0][0]:
+            shift_reasons.append("前后半段正文字体不同")
+        ha = Counter(c for s in seg_a for c in s["table_header_colors_cn"]).most_common(1)
+        hb = Counter(c for s in seg_b for c in s["table_header_colors_cn"]).most_common(1)
+        if ha and hb and ha[0][0] != hb[0][0]:
+            shift_reasons.append("前后半段表格表头配色不同")
+        da = sum(1 for s in seg_a if s["is_dark_bg"]) / max(len(seg_a), 1)
+        db = sum(1 for s in seg_b if s["is_dark_bg"]) / max(len(seg_b), 1)
+        if abs(da - db) >= 0.7:
+            shift_reasons.append("前后半段深浅背景反转")
+        ca = sum(s["slide_char_count"] for s in seg_a) / max(len(seg_a), 1)
+        cb = sum(s["slide_char_count"] for s in seg_b) / max(len(seg_b), 1)
+        if max(ca, cb) >= max(min(ca, cb), 1.0) * 2.5 and abs(ca - cb) >= 120:
+            shift_reasons.append("前后半段文字密度大幅跳变")
+        if len(shift_reasons) >= 2:
+            collab_signals.append("同母版下存在风格突变（" + "、".join(shift_reasons) + "）")
+
+    if (len(content_slides) < 2 and total_content_chars < 60) or (
+        content_slides and (placeholder_hits / len(content_slides)) >= 0.6
+    ):
+        triage_group = "gray_template"
+        triage_reason = "页面多为空白占位框架，判定为模板壳文件"
+    elif collab_signals:
+        triage_group = "yellow_suspected_collab"
+        triage_reason = "；".join(collab_signals)
+    else:
+        triage_group = "green_likely_personal"
+        triage_reason = "画风与署名一致，较像完整个人作品"
+
     return {
         "file": path.name,
         "path": str(path),
         "slide_size_in": [slide_w_in, slide_h_in],
         "total_slides": len(slides_data),
+        "metadata": metadata,
+        "theme_tokens": theme_tokens,
+        "triage_group": triage_group,
+        "collab_signals": collab_signals,
+        "triage_reason": triage_reason,
         "slides": slides_data,
         "chapter_blocks": blocks,
         "anomaly_candidates": anomalies,
     }
+
+
+def extract_clean_master_pptx(src_pptx_path: str, out_template_path: str) -> dict[str, Any]:
+    """从代表作中剥离全部内容页，保留真实母版/版式/主题色板生成干净模板底座。"""
+    src = Path(src_pptx_path).resolve()
+    out_p = Path(out_template_path).resolve()
+    if not src.is_file():
+        return {"status": "ERROR", "message": f"找不到源文件：{src}"}
+    if importlib.util.find_spec("pptx") is None:
+        return {
+            "status": "FALLBACK_REFERENCE",
+            "mode": "source_reference",
+            "template_path": str(src),
+        }
+    from pptx import Presentation
+
+    prs = Presentation(str(src))
+    sld_id_lst = prs.slides._sldIdLst
+    rel_attr = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
+    for sld_el in list(sld_id_lst):
+        rid = sld_el.attrib.get(rel_attr, "")
+        sld_id_lst.remove(sld_el)
+        if rid:
+            try:
+                prs.part.drop_rel(rid)
+            except Exception:
+                pass
+    out_p.parent.mkdir(parents=True, exist_ok=True)
+    prs.save(str(out_p))
+    return {
+        "status": "EXTRACTED",
+        "mode": "clean_master_pptx",
+        "template_path": str(out_p),
+    }
+
+
+SCENARIO_RULES: list[tuple[re.Pattern[str], str, str, str]] = [
+    (re.compile(r"(月会|月例会|周会|周报|例会|进展|同步)"), "sc_progress", "例会与进展汇报", "核心进展与指标 → 问题卡点 → 下一步动作"),
+    (re.compile(r"(复盘|总结|回顾|迭代|运营)"), "sc_review", "项目复盘与迭代", "现状基线与数据证据 → 根因诊断 → 取舍与改进计划"),
+    (re.compile(r"(方案|立项|评审|规划|启动|架构)"), "sc_proposal", "方案评审与立项", "背景痛点 → 核心方案机制 → 角色落地与收益预期"),
+    (re.compile(r"(客户|提案|宣讲|推介|招商|销售)"), "sc_pitch", "对外客户提案与宣讲", "客户痛点共鸣 → 解决方案与案例证据 → 合作价值"),
+    (re.compile(r"(培训|分享|答辩|演讲|教学)"), "sc_sharing", "培训分享与答辩", "核心观点开篇 → 原理或案例拆解 → 实操落地清单"),
+]
+
+
+def _infer_deck_scenario(deck: dict[str, Any]) -> tuple[str, str, str]:
+    text_probe = deck.get("file", "") + " " + " ".join(s.get("title", "") for s in deck.get("slides", [])[:5])
+    for pat, sc_id, sc_name, skel in SCENARIO_RULES:
+        if pat.search(text_probe):
+            return sc_id, sc_name, skel
+    return "sc_general", "综合汇报", "核心结论先行 → 分块论据展开 → 下一步行动"
+
+
+def _classify_slide_framework(s: dict[str, Any]) -> tuple[str, str, str]:
+    if s.get("chart_kinds"):
+        return "fw_chart_trend", "图表趋势与对比页", "图表＋核心变化结论"
+    if s.get("table_count", 0) > 0:
+        if s.get("slide_char_count", 0) >= 220:
+            return "fw_table_detail", "明细数据与口径对照页", "原生数据表＋补充说明"
+        return "fw_table_summary", "结构化对比表页", "精简对照表＋核心结论"
+    if s.get("vector_diagram_signals", 0) >= 2 or s.get("has_smartart"):
+        return "fw_process_diagram", "流程与机制示意图页", "原生步骤流/结构图＋要点"
+    if s.get("pic_count", 0) > 0:
+        return "fw_visual_evidence", "截图/图片实证页", "主视觉截图＋任务型短标签"
+    if s.get("slide_char_count", 0) <= 90:
+        return "fw_core_statement", "极简核心观点页", "醒目大号核心结论＋极少修饰"
+    return "fw_multi_column", "分栏要点阐述页", "多栏分块结构＋归纳结论"
+
+
+def _suggest_framework_adjustment(fw_key: str, has_hygiene: bool, avg_chars: float) -> str:
+    if has_hygiene or avg_chars >= 260:
+        if fw_key == "fw_table_detail":
+            return "原稿明细表和结论文字挤在一页里，建议拆成「1页完整明细表＋1页极简管理结论大数字页」，或适当删减背景字数"
+        if fw_key == "fw_multi_column":
+            return "原稿单页文字偏密或靠边太紧，建议按安全留白改用2～3栏清晰对齐，每栏控制3～4条短句"
+        return "原稿局部存在字号偏小或靠边过紧，建议保留结构关系的同时放宽留白与字号层级"
+    if fw_key == "fw_core_statement":
+        return "仅在少数页出现的极简表达，建议明确归为过渡结论页或管理总结页，避免正文中段突然留白过多"
+    return "样本量较少，建议确认是否按「主题＋结论标题配2～3个清晰分区」作为固定结构沉淀"
 
 
 def scan_corpus(deck_specs: list[dict[str, Any]]) -> dict[str, Any]:
@@ -1152,6 +1404,124 @@ def scan_corpus(deck_specs: list[dict[str, Any]]) -> dict[str, Any]:
     l1_decks = [d for d in valid_decks if d["file"] not in ignored_files and (d["category"] == "full_personal" or d["module_l1_eligible"])]
     l1_page_counts = [sum(1 for s in d["slides"] if s["included"]) for d in l1_decks]
 
+    # L1 Scenarios + L2 Frameworks per Scenario + L3 Visual Skins
+    active_valid_decks = [d for d in valid_decks if d["file"] not in ignored_files]
+    sc_buckets: dict[str, dict[str, Any]] = {}
+    fw_buckets: dict[tuple[str, str], dict[str, Any]] = {}
+    skin_buckets: dict[tuple[bool, str, str], dict[str, Any]] = {}
+
+    for d in active_valid_decks:
+        sc_id, sc_name, sc_skel = _infer_deck_scenario(d)
+        sc_b = sc_buckets.setdefault(
+            sc_id,
+            {
+                "scenario_id": sc_id,
+                "scenario_name": sc_name,
+                "deck_files": [],
+                "page_counts": [],
+                "typical_skeleton": sc_skel,
+            },
+        )
+        sc_b["deck_files"].append(d["file"])
+        sc_b["page_counts"].append(sum(1 for s in d["slides"] if s["included"]))
+
+        for s in d["slides"]:
+            if not (s["included"] and s["page_role"] == "content"):
+                continue
+            fw_key, fw_name, fw_carrier = _classify_slide_framework(s)
+            fb = fw_buckets.setdefault(
+                (sc_id, fw_key),
+                {
+                    "framework_id": f"{sc_id}_{fw_key}",
+                    "scenario_id": sc_id,
+                    "scenario_name": sc_name,
+                    "framework_name": fw_name,
+                    "carrier_type": fw_carrier,
+                    "deck_set": set(),
+                    "occurrence_slides": 0,
+                    "hygiene_hits": 0,
+                    "char_counts": [],
+                    "sample_refs": [],
+                },
+            )
+            fb["deck_set"].add(d["file"])
+            fb["occurrence_slides"] += 1
+            if s["hygiene_issues"]:
+                fb["hygiene_hits"] += 1
+            fb["char_counts"].append(s["slide_char_count"])
+            if len(fb["sample_refs"]) < 3:
+                fb["sample_refs"].append({"file": d["file"], "slide_no": s["slide_no"], "title": s["title"] or s["snippet"]})
+
+        tk = d.get("theme_tokens") or {}
+        skin_key = (bool(tk.get("is_dark_bg")), str(tk.get("bg_color_cn", "纯白")), str(tk.get("primary_color_cn", "蓝")))
+        sb = skin_buckets.setdefault(
+            skin_key,
+            {
+                "skin_key": skin_key,
+                "deck_files": [],
+                "sample_deck_path": d["path"],
+                "theme_tokens": tk,
+                "bg_color_cn": skin_key[1],
+                "primary_color_cn": skin_key[2],
+            },
+        )
+        sb["deck_files"].append(d["file"])
+
+    l1_scenarios = []
+    for sc in sc_buckets.values():
+        dc = len(sc["deck_files"])
+        l1_scenarios.append({
+            "scenario_id": sc["scenario_id"],
+            "scenario_name": sc["scenario_name"],
+            "deck_count": dc,
+            "sample_files": sc["deck_files"][:5],
+            "median_pages": int(statistics.median(sc["page_counts"])) if sc["page_counts"] else 0,
+            "typical_skeleton": sc["typical_skeleton"],
+            "confidence": "high" if dc >= 2 else "medium",
+            "status": "confirmed" if dc >= 2 else "candidate",
+        })
+
+    l2_frameworks = []
+    for fb in fw_buckets.values():
+        occ = fb["occurrence_slides"]
+        indep = len(fb["deck_set"])
+        hygiene_rate = fb["hygiene_hits"] / max(occ, 1)
+        avg_chars = sum(fb["char_counts"]) / max(len(fb["char_counts"]), 1)
+        is_high = (indep >= 2 and occ >= 3 and hygiene_rate < 0.4) or (occ >= 4 and hygiene_rate < 0.25)
+        conf = "high" if is_high else "medium"
+        fw_key_raw = fb["framework_id"].split("_", 2)[-1]
+        adj = _suggest_framework_adjustment(fw_key_raw, hygiene_rate >= 0.3, avg_chars) if (conf == "medium" or hygiene_rate >= 0.3) else ""
+        l2_frameworks.append({
+            "framework_id": fb["framework_id"],
+            "scenario_id": fb["scenario_id"],
+            "scenario_name": fb["scenario_name"],
+            "framework_name": fb["framework_name"],
+            "carrier_type": fb["carrier_type"],
+            "occurrence_slides": occ,
+            "independent_deck_count": indep,
+            "sample_refs": fb["sample_refs"],
+            "confidence": conf,
+            "suggested_adjustment": adj,
+            "status": "confirmed" if conf == "high" else "pending_confirm",
+        })
+
+    l3_visual_skins = []
+    for idx_s, sb in enumerate(skin_buckets.values(), 1):
+        is_dark = sb["skin_key"][0]
+        skin_id = "default" if idx_s == 1 else f"skin_{idx_s}"
+        label_cn = f"{'深色' if is_dark else '浅色'}{sb['primary_color_cn']}主题皮肤"
+        l3_visual_skins.append({
+            "skin_id": skin_id,
+            "label_cn": label_cn,
+            "sample_deck_path": sb["sample_deck_path"],
+            "deck_files": sb["deck_files"],
+            "theme_tokens": sb["theme_tokens"],
+            "bg_color_cn": sb["bg_color_cn"],
+            "primary_color_cn": sb["primary_color_cn"],
+        })
+
+    triage_overview = Counter(d.get("triage_group", "green_likely_personal") for d in decks if "slides" in d)
+
     # Summarize per deck compactly (never dump raw full texts)
     compact_decks = []
     for d in decks:
@@ -1163,6 +1533,8 @@ def scan_corpus(deck_specs: list[dict[str, Any]]) -> dict[str, Any]:
             "category": d["category"],
             "total_slides": d["total_slides"],
             "included_content_slides": sum(1 for s in d["slides"] if s["included"] and s["page_role"] == "content"),
+            "triage_group": d.get("triage_group", "green_likely_personal"),
+            "triage_reason": d.get("triage_reason", ""),
             "chapter_blocks": d["chapter_blocks"],
             "anomaly_candidates": d["anomaly_candidates"],
         })
@@ -1203,6 +1575,14 @@ def scan_corpus(deck_specs: list[dict[str, Any]]) -> dict[str, Any]:
                 if bimodal_bg
                 else ("样本中同时包含高密详述页与极简少字页" if bimodal_density else "")
             ),
+            "l1_scenarios": l1_scenarios,
+            "l2_frameworks": l2_frameworks,
+            "l3_visual_skins": l3_visual_skins,
+            "triage_overview": {
+                "green_likely_personal": triage_overview.get("green_likely_personal", 0),
+                "yellow_suspected_collab": triage_overview.get("yellow_suspected_collab", 0),
+                "gray_template": triage_overview.get("gray_template", 0),
+            },
         },
         "decks": compact_decks,
     }

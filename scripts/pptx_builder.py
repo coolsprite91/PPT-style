@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""pptx_builder.py — 分级可编辑 PPTX 构建器（明示分级 ＋ 安全留白网格 ＋ 隐形编号 ＋ 防占锁写盘）。
+"""pptx_builder.py — 分级可编辑 PPTX 构建器（V0.2.0：三句话降级 ＋ 真实母版皮肤预览 ＋ 多轮 doc_id 继承 ＋ 原地改既有页）。
 
 运行分级底线:
   - 缺少 python-pptx 时绝不静默联网下载，也不强行拼写原生 XML，
-    而是输出结构化 JSON（NEEDS_OPTIONAL_INSTALL）提示引导一键安装或降级文案稿。
+    而是输出标准三句话降级确认 JSON（NEEDS_OPTIONAL_INSTALL）引导确认或降级文案稿。
   - 已安装 python-pptx 时支持：
-    1) preview: 前置 1 页风格预览样稿（应用安全留白网格）
-    2) trial:   2~3 页组合试炼小套组（支持原生表格、矢量步骤流程、柱/折/饼图、等比插图、讲者备注）
-    3) full:    第 3 层完整成稿生成（内置字宽安全余量 15% 超载停机检测）
-    4) patch:   第 5 档局部增改（克隆原 .pptx 并锁定非目标原页 100% 不动）
+    1) preview: 纯 L3 视觉皮肤预览页（优先克隆真实提取母版＋精确色板，支持默认固定示范内容）
+    2) trial:   2~3 页三层组合试炼小套组（支持原生表格、矢量步骤流程、柱/折/饼图、等比插图、讲者备注）
+    3) full:    第 3 层完整成稿生成（跨平台安全字体回退 ＋ 字宽安全余量 15% 超载停机检测）
+    4) patch:   第 5 档局部增改（继承原 doc_id、AI 续改前自动补抓上轮人改、支持插入与 replace_slides 原地改页）
 """
 
 from __future__ import annotations
@@ -36,6 +36,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
+import env_probe
 import snapshot_diff
 
 
@@ -43,6 +44,7 @@ SAFE_MARGIN_LEFT_IN = 0.60
 SAFE_MARGIN_RIGHT_IN = 0.60
 SAFE_MARGIN_TOP_IN = 0.45
 SAFE_MARGIN_BOTTOM_IN = 0.45
+REL_ID_ATTR = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
 
 
 def _probe_image_size_px(img_path: Path) -> tuple[int, int] | None:
@@ -111,7 +113,7 @@ def estimate_text_overflow(
 
 
 def _hex_to_rgb_tuple(hex_str: str, fallback: tuple[int, int, int] = (31, 78, 121)) -> tuple[int, int, int]:
-    cleaned = hex_str.strip().lstrip("#")
+    cleaned = (hex_str or "").strip().lstrip("#")
     if len(cleaned) != 6:
         return fallback
     try:
@@ -140,8 +142,9 @@ def _save_with_lock_fallback(prs: Any, out_path: Path) -> tuple[Path, bool]:
 
 def _check_blueprint_overflow(blueprint: dict[str, Any]) -> list[dict[str, Any]]:
     default_body_pt = float(blueprint.get("theme", {}).get("body_size_pt", 14.0))
+    all_specs = list(blueprint.get("slides", [])) + list(blueprint.get("replace_slides", []))
     overflows: list[dict[str, Any]] = []
-    for idx, slide_spec in enumerate(blueprint.get("slides", []), 1):
+    for idx, slide_spec in enumerate(all_specs, 1):
         blocks = slide_spec.get("blocks", [])
         n_blocks = max(1, len(blocks))
         box_w = (13.333 - SAFE_MARGIN_LEFT_IN - SAFE_MARGIN_RIGHT_IN - 0.25 * (n_blocks - 1)) / n_blocks
@@ -155,7 +158,7 @@ def _check_blueprint_overflow(blueprint: dict[str, Any]) -> list[dict[str, Any]]
             est = estimate_text_overflow(txt, box_w, box_h, pt)
             if est["overflow"]:
                 overflows.append({
-                    "slide_no": slide_spec.get("target_slide_no", idx),
+                    "slide_no": slide_spec.get("slide_no") or slide_spec.get("target_slide_no") or idx,
                     "slide_title": slide_spec.get("title", f"第{idx}页"),
                     "block_index": b_idx,
                     "estimated_lines": est["estimated_lines"],
@@ -207,6 +210,38 @@ def _clear_empty_placeholders(slide: Any) -> None:
                 sp_el.getparent().remove(sp_el)
 
 
+def _default_preview_slides(theme: dict[str, Any]) -> list[dict[str, Any]]:
+    skin_label = theme.get("skin_label") or "提取的个人视觉皮肤"
+    return [{
+        "title": f"纯视觉皮肤预览：{skin_label}",
+        "subtitle": "本页仅用于确认母版、配色、字体层级与干净留白，不涉及具体业务内容",
+        "keep_existing_bg": bool(theme.get("preserve_template_bg", False)),
+        "blocks": [
+            {
+                "type": "bullets",
+                "heading": "字体与留白示范",
+                "items": [
+                    "标题与副标题保持清晰层次",
+                    "正文留白充足，不贴边不重叠",
+                    "重点内容用主配色与加粗突出",
+                ],
+            },
+            {
+                "type": "table",
+                "headers": ["示范列", "样式基准"],
+                "rows": [
+                    ["表头配色", "继承提取主色"],
+                    ["表格行高", "自动留出呼吸感"],
+                ],
+            },
+            {
+                "type": "diagram",
+                "steps": ["风格确认", "场景规划", "生成成稿"],
+            },
+        ],
+    }]
+
+
 def build_pptx(
     blueprint: dict[str, Any],
     out_path_str: str,
@@ -215,20 +250,33 @@ def build_pptx(
     snapshot_root: str | None = None,
     force_shrink: bool = False,
 ) -> dict[str, Any]:
-    """根据结构化蓝图构建可编辑 PPTX；缺依赖时返回明示安装信号。"""
+    """根据结构化蓝图构建可编辑 PPTX；缺依赖时返回标准三句话降级确认信号。"""
     if importlib.util.find_spec("pptx") is None:
+        install_cmd = f'"{sys.executable}" -m pip install python-pptx Pillow'
+        user_cmd = f'"{sys.executable}" -m pip install --user python-pptx Pillow'
+        notice = env_probe.build_degradation_notice(
+            "TIER1_LIGHT",
+            "这台电脑还没有安装用来自动生成可编辑 PPT 文件的小组件。",
+            "读旧稿、提炼风格、定页面大纲和写逐页内容完全正常；只是这次没法直接导出 .pptx 文件，会改成交给你一份带清晰排版说明的逐页文案稿。",
+            f"标准安装：{install_cmd} ；免管理员：{user_cmd}",
+        )
         return {
             "status": "NEEDS_OPTIONAL_INSTALL",
             "fallback_mode": "TEXT_DRAFT_ONLY",
-            "install_command": f'"{sys.executable}" -m pip install python-pptx Pillow',
-            "human_hint": (
-                "本机暂未安装可编辑 PPT 生成组件，我先为你输出结构完整的逐页文案稿；"
-                "若需要直接生成 .pptx 文件，请确认安装轻量写稿组件后重试。"
-            ),
+            "install_command": install_cmd,
+            "degradation_notice": notice,
+            "human_hint": notice["formatted_message"],
         }
 
+    eff_blueprint = dict(blueprint)
+    theme = dict(eff_blueprint.get("theme", {}))
+    if mode == "preview" and not eff_blueprint.get("slides"):
+        if eff_blueprint.get("template_pptx") and "preserve_template_bg" not in theme:
+            theme["preserve_template_bg"] = True
+        eff_blueprint["slides"] = _default_preview_slides(theme)
+
     # Check capacity overflow before building unless user explicitly approved shrinking
-    overflows = _check_blueprint_overflow(blueprint)
+    overflows = _check_blueprint_overflow(eff_blueprint)
     if overflows and not force_shrink:
         return {
             "status": "OVERFLOW_DETECTED",
@@ -248,20 +296,32 @@ def build_pptx(
     from pptx.enum.text import MSO_ANCHOR, PP_ALIGN
     from pptx.util import Inches, Pt
 
-    theme = blueprint.get("theme", {})
     primary_rgb = RGBColor(*_hex_to_rgb_tuple(theme.get("primary_hex", "1F4E79")))
     accent_rgb = RGBColor(*_hex_to_rgb_tuple(theme.get("accent_hex", "D96B27"), (217, 107, 39)))
     bg_rgb = RGBColor(*_hex_to_rgb_tuple(theme.get("bg_hex", "FFFFFF"), (255, 255, 255)))
     text_rgb = RGBColor(*_hex_to_rgb_tuple(theme.get("text_hex", "222222"), (34, 34, 34)))
-    font_name = theme.get("font_name", "Microsoft YaHei")
+    raw_font = theme.get("font_name", "Microsoft YaHei")
+    font_info = env_probe.resolve_safe_font(raw_font)
+    font_name = font_info["resolved_font"]
     title_pt = float(theme.get("title_size_pt", 22.0))
     subtitle_pt = float(theme.get("subtitle_size_pt", 14.0))
     body_pt = float(theme.get("body_size_pt", 13.0))
 
+    inherited_id: str | None = None
+    captured_prior: dict[str, Any] | None = None
+    if base_pptx_str and Path(base_pptx_str).is_file():
+        inherited_id = snapshot_diff.extract_doc_id(Path(base_pptx_str))
+        if inherited_id:
+            captured_prior = snapshot_diff.capture_human_revision_if_changed(
+                base_pptx_str,
+                snapshot_root=snapshot_root,
+                doc_id=inherited_id,
+            )
+
     if mode == "patch" and base_pptx_str and Path(base_pptx_str).is_file():
         prs = Presentation(base_pptx_str)
-    elif blueprint.get("template_pptx") and Path(blueprint["template_pptx"]).is_file():
-        prs = Presentation(blueprint["template_pptx"])
+    elif eff_blueprint.get("template_pptx") and Path(eff_blueprint["template_pptx"]).is_file():
+        prs = Presentation(eff_blueprint["template_pptx"])
     else:
         prs = Presentation()
         prs.slide_width = Inches(13.333)
@@ -276,12 +336,18 @@ def build_pptx(
     font_scale = min(scale_w, scale_h)
 
     blank_layout = _select_blank_layout(prs)
+    has_template_base = bool(
+        (mode == "patch" and base_pptx_str and Path(base_pptx_str).is_file())
+        or (eff_blueprint.get("template_pptx") and Path(eff_blueprint["template_pptx"]).is_file())
+    )
 
     def _populate_slide(slide: Any, spec: dict[str, Any]) -> None:
         _clear_empty_placeholders(slide)
 
-        # Optional clean background
-        if not spec.get("keep_existing_bg", False):
+        keep_bg = spec.get("keep_existing_bg")
+        if keep_bg is None:
+            keep_bg = bool(has_template_base and theme.get("preserve_template_bg", False))
+        if not keep_bg:
             fill = slide.background.fill
             fill.solid()
             fill.fore_color.rgb = bg_rgb
@@ -291,7 +357,6 @@ def build_pptx(
         margin_t = SAFE_MARGIN_TOP_IN * scale_h
         content_w = slide_w_in - margin_l - margin_r
 
-        # Title + conclusion subtitle
         title_box = slide.shapes.add_textbox(
             Inches(margin_l),
             Inches(margin_t),
@@ -314,7 +379,6 @@ def build_pptx(
             p1.font.size = Pt(round(subtitle_pt * font_scale, 1))
             p1.font.color.rgb = text_rgb
 
-        # Divider line
         line_shape = slide.shapes.add_shape(
             MSO_SHAPE.RECTANGLE,
             Inches(margin_l),
@@ -500,17 +564,36 @@ def build_pptx(
 
     # Build or patch slides
     if mode == "patch" and base_pptx_str and Path(base_pptx_str).is_file():
-        insert_after = blueprint.get("insert_after_slide", len(prs.slides))
-        new_slides_specs = blueprint.get("slides", [])
+        sld_id_lst = prs.slides._sldIdLst
+        # 1. 原地替换指定既有页（其余页 100% 不动）
+        for rep_spec in eff_blueprint.get("replace_slides", []):
+            target_no = int(rep_spec.get("slide_no") or rep_spec.get("target_slide_no") or 0)
+            if target_no < 1 or target_no > len(prs.slides):
+                continue
+            new_slide = prs.slides.add_slide(blank_layout)
+            _populate_slide(new_slide, rep_spec)
+            new_el = sld_id_lst[-1]
+            old_el = sld_id_lst[target_no - 1]
+            old_rid = old_el.attrib.get(REL_ID_ATTR, "")
+            sld_id_lst.remove(new_el)
+            old_el.addprevious(new_el)
+            sld_id_lst.remove(old_el)
+            if old_rid:
+                try:
+                    prs.part.drop_rel(old_rid)
+                except Exception:
+                    pass
+
+        # 2. 在指定页位后插入新页
+        insert_after = eff_blueprint.get("insert_after_slide", len(prs.slides))
+        new_slides_specs = eff_blueprint.get("slides", [])
         initial_count = len(prs.slides)
         added_count = 0
         for s_spec in new_slides_specs:
             slide = prs.slides.add_slide(blank_layout)
             _populate_slide(slide, s_spec)
             added_count += 1
-        # Reorder newly appended slides to sit right after `insert_after` without touching original slides
         if 0 <= insert_after < initial_count and added_count > 0:
-            sld_id_lst = prs.slides._sldIdLst
             all_ids = list(sld_id_lst)
             moved = all_ids[initial_count:]
             kept = all_ids[:initial_count]
@@ -520,22 +603,24 @@ def build_pptx(
             for el in new_order:
                 sld_id_lst.append(el)
     else:
-        for s_spec in blueprint.get("slides", []):
+        for s_spec in eff_blueprint.get("slides", []):
             slide = prs.slides.add_slide(blank_layout)
             _populate_slide(slide, s_spec)
 
-    # Stamp invisible doc_id in core properties
-    doc_id = blueprint.get("doc_id") or uuid.uuid4().hex[:12]
+    # 继承原有隐形 doc_id 或创建新 doc_id
+    doc_id = eff_blueprint.get("doc_id") or inherited_id or uuid.uuid4().hex[:12]
     existing_comments = prs.core_properties.comments or ""
     if "[ppt-style-id:" not in existing_comments:
         prs.core_properties.comments = (existing_comments + f" [ppt-style-id:{doc_id}]").strip()
 
     final_path, lock_incremented = _save_with_lock_fallback(prs, Path(out_path_str))
+    snap_role = "ai_revise" if (mode == "patch" or inherited_id) else "ai_build"
     snap_res = snapshot_diff.save_snapshot(
         str(final_path),
         snapshot_root=snapshot_root,
         doc_id=doc_id,
         source_label=f"built_{mode}",
+        role=snap_role,
     )
 
     return {
@@ -544,6 +629,9 @@ def build_pptx(
         "output_path": str(final_path),
         "lock_incremented": lock_incremented,
         "doc_id": doc_id,
+        "rev_id": snap_res.get("rev_id"),
+        "captured_prior_human_rev": captured_prior,
+        "font_resolution": font_info,
         "slide_count": len(prs.slides),
         "snapshot_saved": snap_res.get("status") == "SAVED",
         "human_hint": (
@@ -562,7 +650,7 @@ def main(argv: list[str] | None = None) -> int:
     p_b.add_argument("--blueprint", required=True, help="JSON 蓝图文件路径")
     p_b.add_argument("--out", required=True, help="输出 PPTX 路径")
     p_b.add_argument("--mode", choices=("preview", "trial", "full", "patch"), default="full")
-    p_b.add_argument("--base-pptx", default=None, help="局部增改模式下的基础 PPTX")
+    p_b.add_argument("--base-pptx", default=None, help="局部增改或续改模式下的基础 PPTX")
     p_b.add_argument("--snapshot-root", default=None, help="快照根目录（可选，便于隔离测试）")
     p_b.add_argument("--force-shrink", action="store_true", help="经用户确认后允许缩小字号")
 

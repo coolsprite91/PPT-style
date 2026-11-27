@@ -20,20 +20,26 @@ for %%P in (
     "C:\Program Files\Python312\python.exe"
 ) do (
     if exist %%P (
-        set "REAL_PY=%%~P"
-        goto :found_py
+        "%%~P" -c "import sys; assert sys.version_info[0]==3" >nul 2>&1
+        if not errorlevel 1 (
+            set "REAL_PY=%%~P"
+            goto :found_py
+        )
     )
 )
 
 for /f "delims=" %%I in ('where python 2^>nul') do (
     echo %%I | findstr /I "WindowsApps" >nul
     if errorlevel 1 (
-        set "REAL_PY=%%I"
-        goto :found_py
+        "%%I" -c "import sys; assert sys.version_info[0]==3" >nul 2>&1
+        if not errorlevel 1 (
+            set "REAL_PY=%%I"
+            goto :found_py
+        )
     )
 )
 
-echo [提示] 这台电脑上还没有安装 Python 运行环境。
+echo [提示] 这台电脑上还没有真实可用的 Python 3 运行环境。
 echo.
 echo 请按下面两步快速准备：
 echo   1. 在浏览器打开 https://www.python.org/downloads/ 下载安装包；
@@ -58,5 +64,6 @@ echo 请【新开一个对话窗口】（或重启你的 AI 软件），先发�
 echo     检查 PPT-style 是否就绪
 echo.
 echo 看到【PPT-style ... 已激活就绪】回复后，再发：帮我建 PPT 风格工坊
+echo 如果新开对话后反馈找不到技能，请让当前 AI 检查它实际读取的全局技能目录并同步。
 echo.
 pause

@@ -46,6 +46,7 @@ if str(SCRIPT_DIR) not in sys.path:
 
 import output_guard
 import pptx_inspector
+import env_probe
 
 
 CATEGORY_DIR_MAP = {
@@ -113,21 +114,25 @@ def _has_contiguous_run(pages: list[int], min_len: int = 5) -> bool:
 
 def _ensure_default_profile(home_dir: Path, profile_id: str = "default") -> Path:
     pdir = home_dir / "profiles" / profile_id
-    (pdir / "masks").mkdir(parents=True, exist_ok=True)
+    (pdir / "masks" / "templates").mkdir(parents=True, exist_ok=True)
     (pdir / "history").mkdir(parents=True, exist_ok=True)
     l1_p = pdir / "core_l1_planning.json"
     l2_p = pdir / "core_l2_content.json"
     mask_p = pdir / "masks" / "default.json"
     if not l1_p.is_file():
-        _save_json(l1_p, {"version": "1.0", "rules": [], "settings": {}})
+        _save_json(l1_p, {"version": "2.0", "rules": [], "scenarios": [], "settings": {}})
     if not l2_p.is_file():
-        _save_json(l2_p, {"version": "1.0", "rules": [], "settings": {"notes_dual_channel": False}})
+        _save_json(l2_p, {"version": "2.0", "rules": [], "frameworks": [], "settings": {"notes_dual_channel": False}})
     if not mask_p.is_file():
         _save_json(mask_p, {
             "mask_id": "default",
             "mask_name": "默认汇报风格",
-            "version": "1.0",
+            "version": "2.0",
             "rules": [],
+            "template_pptx": "",
+            "theme_tokens": {},
+            "binding_mode": "bound",
+            "bound_scenarios": [],
             "settings": {"clean_grid_enabled": True},
         })
     return pdir
@@ -151,21 +156,55 @@ def _snapshot_profile(home_dir: Path, profile_id: str, reason: str) -> str:
     return str(snap_path)
 
 
+def _find_git_root(path: Path) -> Path | None:
+    cur = path.resolve() if path.exists() else path
+    for cand in (cur, *cur.parents):
+        if (cand / ".git").exists():
+            return cand
+    return None
+
+
+def _is_temp_upload_path(src_path: Path) -> bool:
+    norm = str(src_path).replace("\\", "/").lower()
+    markers = ("/uploads/", "/browser_sandbox/uploads/", "/chat_uploads/", "/temp_uploads/", "/.gemini/antigravity/")
+    return any(m in norm for m in markers)
+
+
 def _workshop_dir(workspace: str | None, default_home: bool = False) -> Path:
     if default_home or not workspace:
-        return Path.home() / "Documents" / "我的PPT风格工坊"
+        docs = env_probe.detect_documents_dir()
+        return Path(docs["path"]) / "我的PPT风格工坊"
     ws = Path(workspace)
-    if ws.name == "PPT风格工坊":
+    if ws.name in ("PPT风格工坊", "我的PPT风格工坊"):
         return ws
     return ws / "PPT风格工坊"
 
 
 def init_workshop(workspace: str | None, default_home: bool, home_dir: Path) -> dict[str, Any]:
     wdir = _workshop_dir(workspace, default_home=default_home)
+    if not env_probe._check_dir_writable_no_create(wdir):
+        return {
+            "status": "ERROR_NOT_WRITABLE",
+            "workshop_dir": str(wdir),
+            "human_hint": f"无法在「{wdir}」创建工坊（没有写入权限），请换一个你有写入权限的文件夹，或直接用默认个人文档目录。",
+        }
+
     archive = wdir / "01-原始代表作归档"
     for sub in CATEGORY_DIR_MAP.values():
         (archive / sub).mkdir(parents=True, exist_ok=True)
     (wdir / "02-试炼样稿与调优").mkdir(parents=True, exist_ok=True)
+
+    git_root = _find_git_root(wdir)
+    inside_git = git_root is not None
+    git_warning = ""
+    if inside_git:
+        gi_path = wdir / ".gitignore"
+        if not gi_path.is_file():
+            gi_path.write_text("*\n!.gitignore\n", encoding="utf-8")
+        git_warning = (
+            "检测到你指定的目录位于项目版本库内，我已在工坊目录自动配好忽略清单防误上传；"
+            "如果只是想放个人工作区，也随时可以改放个人文档目录。"
+        )
 
     manifest_p = archive / ".archive-manifest.json"
     if not manifest_p.is_file():
@@ -198,7 +237,13 @@ def init_workshop(workspace: str | None, default_home: bool, home_dir: Path) -> 
     _save_json(reg_p, reg)
 
     render_hub(wdir, home_dir)
-    return {"status": "INITIALIZED", "workshop_dir": str(wdir.resolve()), "registry_path": str(reg_p)}
+    return {
+        "status": "INITIALIZED",
+        "workshop_dir": str(wdir.resolve()),
+        "registry_path": str(reg_p),
+        "inside_git_repo": inside_git,
+        "git_warning_hint": git_warning,
+    }
 
 
 def _copy_with_media_strip(src: Path, dst: Path, strip_av: bool) -> bool:
@@ -223,16 +268,81 @@ AUTHOR_STOPWORDS = {
 }
 
 
+def triage_paths(paths_list: list[str]) -> dict[str, Any]:
+    """对目录或文件列表做多信号预分诊：分出绿组(纯个人)/黄组(疑似合写)/灰组(纯模板)/待处理格式异常。"""
+    files: list[Path] = []
+    for raw in paths_list:
+        p = Path(raw)
+        if p.is_dir() and p.suffix.lower() == ".key":
+            files.append(p)
+        elif p.is_dir():
+            files.extend(sorted(x for x in p.iterdir() if x.is_file() or (x.is_dir() and x.suffix.lower() == ".key")))
+        elif p.exists():
+            files.append(p)
+
+    green_group: list[dict[str, Any]] = []
+    yellow_group: list[dict[str, Any]] = []
+    gray_group: list[dict[str, Any]] = []
+    needs_attention: list[dict[str, Any]] = []
+
+    for fp in files:
+        chk = pptx_inspector.check_file(str(fp))
+        st = chk.get("status")
+        if st != "VALID_PPTX":
+            needs_attention.append({"file": fp.name, "path": str(fp), "status": st, "human_hint": chk.get("human_hint", "")})
+            continue
+        insp = pptx_inspector.inspect_deck(str(fp))
+        tg = insp.get("triage_group", "green_likely_personal")
+        item = {
+            "file": fp.name,
+            "path": str(fp),
+            "total_slides": insp.get("total_slides", 0),
+            "triage_group": tg,
+            "triage_reason": insp.get("triage_reason", ""),
+            "collab_signals": insp.get("collab_signals", []),
+            "chapter_blocks": insp.get("chapter_blocks", [])[:6],
+        }
+        if tg == "yellow_suspected_collab":
+            yellow_group.append(item)
+        elif tg == "gray_template":
+            gray_group.append(item)
+        else:
+            green_group.append(item)
+
+    yellow_prompt = ""
+    if yellow_group:
+        names = "、".join(f"《{x['file']}》（{x['triage_reason']}）" for x in yellow_group[:3])
+        yellow_prompt = (
+            f"检测到 {len(yellow_group)} 份疑似多人合写稿：{names}。\n"
+            "提醒：提炼个人风格尽量不要把同事写的页面混进来，否则容易学偏。\n"
+            "请确认怎么处理这些合写稿（共 1 个问题）：\n"
+            "A. 一键去掉，这次暂不纳入提炼（推荐最省心）\n"
+            "B. 保留但标出哪些页是我写的（直接报页码或关键词，不拆原文件）\n"
+            "C. 我确认整份都是我自己写的"
+        )
+
+    return {
+        "status": "TRIAGED",
+        "total_scanned": len(files),
+        "green_likely_personal": green_group,
+        "yellow_suspected_collab": yellow_group,
+        "gray_template": gray_group,
+        "needs_attention": needs_attention,
+        "human_triage_prompt": yellow_prompt,
+    }
+
+
 def scan_directory(dir_path_str: str) -> dict[str, Any]:
-    """对本地整目录做只读分诊：统计格式分布、总大小、精确重复与多作者署名，推荐轻量引用或复制归档。"""
+    """对本地整目录做只读分诊：统计格式分布、总大小、精确重复、多作者署名与合写预分诊。"""
     target = Path(dir_path_str)
     if not target.is_dir():
         return {"status": "ERROR", "message": f"找不到目录：{dir_path_str}"}
 
-    files = sorted(p for p in target.iterdir() if p.is_file())
+    files = sorted(p for p in target.iterdir() if p.is_file() or (p.is_dir() and p.suffix.lower() == ".key"))
     valid_pptx = 0
     visual_ref = 0
     needs_convert = 0
+    suspected_drm = 0
     other_files = 0
     total_bytes = 0
     sha_seen: dict[str, str] = {}
@@ -242,7 +352,8 @@ def scan_directory(dir_path_str: str) -> dict[str, Any]:
     author_counts: dict[str, int] = {}
 
     for p in files:
-        total_bytes += p.stat().st_size
+        if p.is_file():
+            total_bytes += p.stat().st_size
         chk = pptx_inspector.check_file(str(p))
         st = chk.get("status")
         if st == "VALID_PPTX":
@@ -261,6 +372,8 @@ def scan_directory(dir_path_str: str) -> dict[str, Any]:
             visual_ref += 1
         elif st == "NEEDS_USER_CONVERT":
             needs_convert += 1
+        elif st == "SUSPECTED_DRM_ENCRYPTED":
+            suspected_drm += 1
         else:
             other_files += 1
 
@@ -272,10 +385,13 @@ def scan_directory(dir_path_str: str) -> dict[str, Any]:
     total_mb = round(total_bytes / (1024 * 1024), 1)
     rec_mode = "reference" if (total_mb > 500.0 or valid_pptx > 20) else "copy"
     detected_authors = sorted(author_counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    triage_res = triage_paths([str(target)]) if valid_pptx <= 30 else None
 
     hint_parts = [
-        f"共扫描 {len(files)} 个文件（合计约 {total_mb} MB）：其中 {valid_pptx} 份可提炼的 .pptx、{visual_ref} 份 PDF/图片参考、{needs_convert} 份老式格式需先另存为。"
+        f"共扫描 {len(files)} 个文件（合计约 {total_mb} MB）：其中 {valid_pptx} 份可提炼的演示稿、{visual_ref} 份 PDF/图片参考、{needs_convert} 份需先另存为格式。"
     ]
+    if suspected_drm:
+        hint_parts.append(f"另有 {suspected_drm} 份文件疑似被公司加密软件锁定。")
     if exact_duplicates:
         hint_parts.append(f"发现 {len(exact_duplicates)} 对完全重复文件。")
     if len(detected_authors) >= 2:
@@ -292,12 +408,14 @@ def scan_directory(dir_path_str: str) -> dict[str, Any]:
         "valid_pptx_count": valid_pptx,
         "visual_ref_count": visual_ref,
         "needs_convert_count": needs_convert,
+        "suspected_drm_count": suspected_drm,
         "other_count": other_files,
         "exact_duplicates": exact_duplicates,
         "heavy_av_count": len(heavy_av_files),
         "heavy_image_only_count": len(heavy_image_only_files),
         "detected_authors": [{"name": n, "count": c} for n, c in detected_authors],
         "recommended_copy_mode": rec_mode,
+        "collab_triage": triage_res,
         "human_hint": " ".join(hint_parts),
     }
 
@@ -310,6 +428,7 @@ def intake_file(
     external_toc: bool,
     home_dir: Path,
     copy_mode: str = "copy",
+    from_upload: bool = False,
 ) -> dict[str, Any]:
     if category not in CATEGORY_DIR_MAP:
         return {"status": "ERROR", "message": f"未知分类：{category}"}
@@ -317,7 +436,7 @@ def intake_file(
         return {"status": "ERROR", "message": f"不支持的收样存储模式：{copy_mode}"}
 
     chk = pptx_inspector.check_file(src_file)
-    if chk.get("status") in ("MISSING", "NEEDS_USER_CONVERT", "UNSUPPORTED", "CORRUPTED"):
+    if chk.get("status") in ("MISSING", "NEEDS_USER_CONVERT", "SUSPECTED_DRM_ENCRYPTED", "UNSUPPORTED", "CORRUPTED"):
         return {**chk, "status": "REJECTED", "reject_reason": chk.get("status")}
 
     manifest_p = wdir / "01-原始代表作归档" / ".archive-manifest.json"
@@ -325,6 +444,8 @@ def intake_file(
     items: list[dict[str, Any]] = manifest["items"]
 
     src_path = Path(src_file).resolve()
+    forced_copy = bool(from_upload or _is_temp_upload_path(src_path))
+    eff_copy_mode = "copy" if forced_copy else copy_mode
     file_sha = chk.get("sha256")
     if not file_sha:
         h = hashlib.sha256()
@@ -339,7 +460,7 @@ def intake_file(
                 "human_hint": f"《{src_path.name}》与已归档的《{existing['archived_name']}》内容完全相同，已自动跳过，不会重复算权重。",
             }
 
-    if copy_mode == "reference":
+    if eff_copy_mode == "reference":
         dst_path = src_path
         if chk.get("status") == "VISUAL_REF_ONLY":
             entry = {
@@ -349,6 +470,7 @@ def intake_file(
                 "sha256": file_sha,
                 "category": category,
                 "storage_mode": "reference",
+                "forced_copy_from_upload": forced_copy,
                 "format_status": "VISUAL_REF_ONLY",
                 "selected_slides": [],
                 "module_l1_eligible": False,
@@ -375,6 +497,7 @@ def intake_file(
                 "sha256": file_sha,
                 "category": category,
                 "storage_mode": "copy",
+                "forced_copy_from_upload": forced_copy,
                 "format_status": "VISUAL_REF_ONLY",
                 "selected_slides": [],
                 "module_l1_eligible": False,
@@ -398,7 +521,8 @@ def intake_file(
         "path": str(dst_path),
         "sha256": file_sha,
         "category": category,
-        "storage_mode": copy_mode,
+        "storage_mode": eff_copy_mode,
+        "forced_copy_from_upload": forced_copy,
         "format_status": "VALID_PPTX",
         "media_stripped": stripped,
         "total_slides": deck_info.get("total_slides", 0),
@@ -791,7 +915,7 @@ def _upsert_layer_rule(target_p: Path, layer: str, source_id: str, text: str) ->
 
 
 def _sync_wizard_answers_to_profile(wdir: Path, state: dict[str, Any], home_dir: Path) -> None:
-    """将向导中用户已确认的自动规律、单选题结论与体检基础参数自动沉淀入激活档案。"""
+    """将向导中用户已确认的规律、L1场景、L2多框架及L3多母版皮肤自动沉淀入激活档案。"""
     pid = state.get("active_profile", "default")
     mid = state.get("active_mask", "default")
     pdir = _ensure_default_profile(home_dir, pid)
@@ -815,27 +939,101 @@ def _sync_wizard_answers_to_profile(wdir: Path, state: dict[str, Any], home_dir:
 
     summary = state.get("scan_summary") or {}
     if summary:
-        l2_data = _load_json(layer_paths["L2"], {"version": "1.0", "rules": [], "settings": {}})
+        # 1. L1 场景库同步
+        l1_data = _load_json(layer_paths["L1"], {"version": "2.0", "rules": [], "scenarios": [], "settings": {}})
+        existing_sc_map = {s["scenario_id"]: s for s in l1_data.get("scenarios", []) if s.get("scenario_id")}
+        for sc in summary.get("l1_scenarios", []):
+            sc_id = sc["scenario_id"]
+            if sc_id in existing_sc_map:
+                existing_sc_map[sc_id].update({
+                    "deck_count": sc.get("deck_count", 0),
+                    "sample_files": sc.get("sample_files", []),
+                    "median_pages": sc.get("median_pages", 0),
+                })
+            else:
+                existing_sc_map[sc_id] = dict(sc)
+        l1_data["scenarios"] = list(existing_sc_map.values())
+        _save_json(layer_paths["L1"], l1_data)
+
+        # 2. L2 按场景多框架同步
+        l2_data = _load_json(layer_paths["L2"], {"version": "2.0", "rules": [], "frameworks": [], "settings": {}})
         l2_data.setdefault("settings", {})["notes_dual_channel"] = bool(summary.get("notes_dual_channel_recommended", False))
+        existing_fw_map = {f["framework_id"]: f for f in l2_data.get("frameworks", []) if f.get("framework_id")}
+        for fw in summary.get("l2_frameworks", []):
+            fw_id = fw["framework_id"]
+            if fw_id in existing_fw_map:
+                # 保留用户已经 confirm-framework 拍板过的状态
+                if existing_fw_map[fw_id].get("status") in ("confirmed", "adjusted_confirmed", "dropped"):
+                    continue
+                existing_fw_map[fw_id].update(fw)
+            else:
+                existing_fw_map[fw_id] = dict(fw)
+        l2_data["frameworks"] = list(existing_fw_map.values())
         _save_json(layer_paths["L2"], l2_data)
 
-        mask_data = _load_json(layer_paths["L3"], {"mask_id": mid, "mask_name": "默认汇报风格", "version": "1.0", "rules": [], "settings": {}})
-        m_settings = mask_data.setdefault("settings", {})
-        for k in (
-            "top_title_font",
-            "top_body_font",
-            "median_title_size_pt",
-            "median_body_size_pt",
-            "dominant_bg_color_cn",
-            "top_accent_colors_cn",
-        ):
-            if k in summary:
-                m_settings[k] = summary[k]
-        # Clean grid preference from user answer if provided
+        # 3. L3 多套真实母版皮肤与绑定关系同步
+        clean_grid_pref = True
         for ans in state.get("answered_questions", []):
             if ans.get("id") == "Q_CORE_L3_GRID":
-                m_settings["clean_grid_enabled"] = not ans.get("answer", "").strip().upper().startswith("B")
-        _save_json(layer_paths["L3"], mask_data)
+                clean_grid_pref = not ans.get("answer", "").strip().upper().startswith("B")
+
+        skins = summary.get("l3_visual_skins") or []
+        all_sc_ids = [sc["scenario_id"] for sc in l1_data.get("scenarios", [])]
+        if skins:
+            templates_dir = pdir / "masks" / "templates"
+            templates_dir.mkdir(parents=True, exist_ok=True)
+            for s_idx, skin in enumerate(skins):
+                skin_id = mid if s_idx == 0 else skin.get("skin_id", f"skin_{s_idx + 1}")
+                m_path = pdir / "masks" / f"{skin_id}.json"
+                m_data = _load_json(m_path, {
+                    "mask_id": skin_id,
+                    "mask_name": skin.get("label_cn", "汇报皮肤"),
+                    "version": "2.0",
+                    "rules": [],
+                    "template_pptx": "",
+                    "theme_tokens": {},
+                    "binding_mode": "bound" if s_idx == 0 else "independent",
+                    "bound_scenarios": all_sc_ids if s_idx == 0 else [],
+                    "settings": {"clean_grid_enabled": clean_grid_pref},
+                })
+                m_data["mask_name"] = m_data.get("mask_name") or skin.get("label_cn", "汇报皮肤")
+                m_data["theme_tokens"] = skin.get("theme_tokens") or m_data.get("theme_tokens", {})
+                if not m_data.get("bound_scenarios") and m_data.get("binding_mode") == "bound":
+                    m_data["bound_scenarios"] = all_sc_ids
+                sample_src = skin.get("sample_deck_path", "")
+                if sample_src and Path(sample_src).is_file():
+                    tpl_out = templates_dir / f"base_{skin_id}.pptx"
+                    ext_res = pptx_inspector.extract_clean_master_pptx(sample_src, str(tpl_out))
+                    if ext_res.get("template_path"):
+                        m_data["template_pptx"] = ext_res["template_path"]
+                m_settings = m_data.setdefault("settings", {})
+                m_settings["clean_grid_enabled"] = clean_grid_pref
+                for k in (
+                    "top_title_font",
+                    "top_body_font",
+                    "median_title_size_pt",
+                    "median_body_size_pt",
+                    "dominant_bg_color_cn",
+                    "top_accent_colors_cn",
+                ):
+                    if k in summary:
+                        m_settings[k] = summary[k]
+                _save_json(m_path, m_data)
+        else:
+            mask_data = _load_json(layer_paths["L3"], {"mask_id": mid, "mask_name": "默认汇报风格", "version": "2.0", "rules": [], "settings": {}})
+            m_settings = mask_data.setdefault("settings", {})
+            m_settings["clean_grid_enabled"] = clean_grid_pref
+            for k in (
+                "top_title_font",
+                "top_body_font",
+                "median_title_size_pt",
+                "median_body_size_pt",
+                "dominant_bg_color_cn",
+                "top_accent_colors_cn",
+            ):
+                if k in summary:
+                    m_settings[k] = summary[k]
+            _save_json(layer_paths["L3"], mask_data)
 
 
 def record_answer(wdir: Path, answers: dict[str, str], home_dir: Path) -> dict[str, Any]:
@@ -1062,6 +1260,130 @@ def handle_profile(args: argparse.Namespace, home_dir: Path) -> dict[str, Any]:
         _save_json(reg_p, reg)
         return {"status": "RESET", "backup_snapshot": snap_p}
 
+    if action == "bind-mask":
+        target_mask = args.mask or reg.get("active_mask", "default")
+        mask_p = pdir / "masks" / f"{target_mask}.json"
+        if not mask_p.is_file():
+            return {"status": "NOT_FOUND", "human_hint": f"未找到名为「{target_mask}」的视觉母版皮肤。"}
+        _snapshot_profile(home_dir, pid, f"bind_mask:{target_mask}")
+        m_data = _load_json(mask_p, {})
+        if getattr(args, "independent", False):
+            m_data["binding_mode"] = "independent"
+            m_data["bound_scenarios"] = []
+        else:
+            sc_list = [s.strip() for s in (getattr(args, "scenarios", None) or "").split(",") if s.strip()]
+            m_data["binding_mode"] = "bound"
+            m_data["bound_scenarios"] = sc_list
+        _save_json(mask_p, m_data)
+        return {
+            "status": "MASK_BINDING_UPDATED",
+            "mask_id": target_mask,
+            "binding_mode": m_data["binding_mode"],
+            "bound_scenarios": m_data["bound_scenarios"],
+        }
+
+    if action == "confirm-scenario":
+        sc_name = (getattr(args, "scenario_name", None) or "").strip()
+        sc_id = (getattr(args, "scenario_id", None) or "").strip()
+        if not sc_name and not sc_id:
+            return {"status": "ERROR", "message": "请提供 --scenario-name 或 --scenario-id"}
+        _snapshot_profile(home_dir, pid, "confirm_scenario")
+        l1_p = pdir / "core_l1_planning.json"
+        l1_data = _load_json(l1_p, {"version": "2.0", "rules": [], "scenarios": [], "settings": {}})
+        scenarios = l1_data.setdefault("scenarios", [])
+        if not sc_id:
+            sc_id = f"sc_custom_{len(scenarios) + 1}"
+        matched = next((s for s in scenarios if s.get("scenario_id") == sc_id or (sc_name and s.get("scenario_name") == sc_name)), None)
+        if matched:
+            if sc_name:
+                matched["scenario_name"] = sc_name
+            if getattr(args, "skeleton", None):
+                matched["typical_skeleton"] = args.skeleton
+            matched["status"] = "confirmed"
+            matched["confidence"] = "high"
+        else:
+            scenarios.append({
+                "scenario_id": sc_id,
+                "scenario_name": sc_name or sc_id,
+                "deck_count": 0,
+                "sample_files": [],
+                "median_pages": 5,
+                "typical_skeleton": getattr(args, "skeleton", None) or "核心结论先行 → 分块论据展开 → 下一步行动",
+                "confidence": "high",
+                "status": "confirmed",
+            })
+        _save_json(l1_p, l1_data)
+        return {"status": "SCENARIO_CONFIRMED", "scenarios": scenarios}
+
+    if action == "confirm-framework":
+        fw_id = (getattr(args, "framework_id", None) or "").strip()
+        decision = getattr(args, "decision", None) or "accept"
+        if not fw_id:
+            return {"status": "ERROR", "message": "请提供 --framework-id"}
+        _snapshot_profile(home_dir, pid, f"confirm_framework:{fw_id}")
+        l2_p = pdir / "core_l2_content.json"
+        l2_data = _load_json(l2_p, {"version": "2.0", "rules": [], "frameworks": [], "settings": {}})
+        frameworks = l2_data.setdefault("frameworks", [])
+        target_fw = next((f for f in frameworks if f.get("framework_id") == fw_id), None)
+        if target_fw is None:
+            return {"status": "NOT_FOUND", "human_hint": f"未找到编号为「{fw_id}」的页面框架。"}
+        if decision == "drop":
+            target_fw["status"] = "dropped"
+        elif decision == "adjust":
+            target_fw["status"] = "adjusted_confirmed"
+            if getattr(args, "note", None):
+                target_fw["applied_adjustment"] = args.note
+            elif target_fw.get("suggested_adjustment"):
+                target_fw["applied_adjustment"] = target_fw["suggested_adjustment"]
+        else:
+            target_fw["status"] = "confirmed"
+        _save_json(l2_p, l2_data)
+        return {"status": "FRAMEWORK_UPDATED", "framework": target_fw}
+
+    if action == "resolve-combo":
+        sc_query = (getattr(args, "scenario", None) or "").strip()
+        req_mask = getattr(args, "mask", None)
+        l1_data = _load_json(pdir / "core_l1_planning.json", {"rules": [], "scenarios": []})
+        l2_data = _load_json(pdir / "core_l2_content.json", {"rules": [], "frameworks": [], "settings": {}})
+        scenarios = l1_data.get("scenarios", [])
+        matched_sc = next(
+            (s for s in scenarios if s.get("scenario_id") == sc_query or sc_query in s.get("scenario_name", "")),
+            scenarios[0] if scenarios else None,
+        )
+        sc_id = matched_sc["scenario_id"] if matched_sc else ""
+        active_fws = [
+            f for f in l2_data.get("frameworks", [])
+            if f.get("status") != "dropped" and (not sc_id or f.get("scenario_id") == sc_id)
+        ]
+        if not active_fws:
+            active_fws = [f for f in l2_data.get("frameworks", []) if f.get("status") != "dropped"]
+
+        masks_dir = pdir / "masks"
+        mask_objs = [_load_json(mp, {}) for mp in sorted(masks_dir.glob("*.json"))]
+        chosen_mask = None
+        if req_mask:
+            chosen_mask = next((m for m in mask_objs if m.get("mask_id") == req_mask or req_mask in m.get("mask_name", "")), None)
+        if chosen_mask is None and sc_id:
+            chosen_mask = next(
+                (m for m in mask_objs if m.get("binding_mode") == "bound" and sc_id in m.get("bound_scenarios", [])),
+                None,
+            )
+        if chosen_mask is None:
+            active_mid = reg.get("active_mask", "default")
+            chosen_mask = next((m for m in mask_objs if m.get("mask_id") == active_mid), mask_objs[0] if mask_objs else {})
+
+        return {
+            "status": "COMBO_RESOLVED",
+            "profile_id": pid,
+            "l1_scenario": matched_sc,
+            "l1_rules": l1_data.get("rules", []),
+            "l2_frameworks": active_fws,
+            "l2_rules": l2_data.get("rules", []),
+            "l2_settings": l2_data.get("settings", {}),
+            "l3_mask": chosen_mask,
+            "combo_mode": "manual_mix" if req_mask else "scenario_default",
+        }
+
     if action == "export-share":
         out_dir = Path(args.out or "./PPT-style-share")
         if out_dir.exists():
@@ -1093,15 +1415,102 @@ def handle_profile(args: argparse.Namespace, home_dir: Path) -> dict[str, Any]:
     return {"status": "ERROR", "message": f"不支持的档案操作：{action}"}
 
 
+def generate_usage_guide(
+    home_dir: Path,
+    wdir: Path | None = None,
+    profile_id: str | None = None,
+) -> dict[str, Any]:
+    """生成固定 5 段范式的大白话调用指南（供提炼完成回执教学与用户随时查询使用）。"""
+    reg = _load_json(_registry_path(home_dir), {})
+    pid = profile_id or reg.get("active_profile", "default")
+    active_mid = reg.get("active_mask", "default")
+    pdir = _ensure_default_profile(home_dir, pid)
+    l1 = _load_json(pdir / "core_l1_planning.json", {"rules": [], "scenarios": []})
+    l2 = _load_json(pdir / "core_l2_content.json", {"rules": [], "frameworks": []})
+
+    masks_dir = pdir / "masks"
+    masks = [_load_json(mp, {}) for mp in sorted(masks_dir.glob("*.json"))]
+    scenarios = l1.get("scenarios", [])
+    frameworks = [f for f in l2.get("frameworks", []) if f.get("status") != "dropped"]
+
+    sc_lines = []
+    prompt_lines = []
+    for sc in scenarios:
+        sc_id = sc.get("scenario_id", "")
+        sc_name = sc.get("scenario_name", sc_id)
+        sc_fws = [f for f in frameworks if f.get("scenario_id") == sc_id]
+        bound_m = next(
+            (m for m in masks if m.get("binding_mode") == "bound" and sc_id in m.get("bound_scenarios", [])),
+            None,
+        )
+        m_label = bound_m.get("mask_name", bound_m.get("mask_id")) if bound_m else "默认模板皮肤"
+        sc_lines.append(f"- {sc_name}：已配 {len(sc_fws)} 套页面框架，默认搭配「{m_label}」")
+        prompt_lines.append(f"- 做「{sc_name}」时，直接说：“帮我按我的{sc_name}风格做一套 PPT”，然后把资料丢给我")
+
+    if not sc_lines:
+        sc_lines.append("- 综合汇报：暂未区分细分场景，按通用汇报习惯启动")
+        prompt_lines.append("- 直接说：“帮我按我的个人风格做一套汇报 PPT”，然后把资料丢给我")
+
+    mask_lines = []
+    for m in masks:
+        m_name = m.get("mask_name") or m.get("mask_id", "默认风格")
+        b_mode = "独立通用（随时可切）" if m.get("binding_mode") == "independent" else "已绑定对应场景"
+        cur_tag = "（当前默认）" if m.get("mask_id") == active_mid else ""
+        mask_lines.append(f"- {m_name}{cur_tag}：{b_mode}")
+
+    alt_mask = next((m for m in masks if m.get("mask_id") != active_mid), masks[0] if masks else {})
+    alt_mask_name = alt_mask.get("mask_name") or "另一套视觉模板"
+    first_sc_name = scenarios[0].get("scenario_name", "汇报") if scenarios else "汇报"
+
+    guide_text = "\n".join([
+        "【你的 PPT 风格资产速览】",
+        f"当前使用档案：{pid}（已沉淀 {len(scenarios)} 个主要场景、{len(frameworks)} 套单页框架、{len(masks)} 套视觉母版皮肤）",
+        *sc_lines,
+        *mask_lines,
+        "",
+        "【按你的场景直接发起】",
+        *prompt_lines,
+        "",
+        "【日常 5 档怎么开口（按需点菜）】",
+        "1. 全套代写：“帮我基于这些资料做一套汇报 PPT”（先定大纲，再写内容，最后排版出稿）",
+        "2. 只做页面规划：“先帮我规划这套汇报分几页、每页讲什么”（先出页数和每页大纲，不用先给全部细数）",
+        "3. 按大纲填内容：“这几页大纲定了，帮我把每页具体内容写出来”（锁死页数和结构，写标题、正文和备注）",
+        "4. 定稿只美化排版：“文字已经定稿了，一字不改帮我按我的风格排版”（数字和文字一字不改，按安全留白排成成品）",
+        "5. 旧稿局部加改页：“在这份 PPT 第 X 页后加两页（或只改第 X 页），别的页别动”（其余页原封不动，仅改指定位置）",
+        "",
+        "【自由混搭与临时借参考】",
+        f"- 场景和皮肤自由混搭：说“用我的{first_sc_name}框架，但视觉换成「{alt_mask_name}」”",
+        "- 临时借用外部参考：直接丢进参考文件说“样式按这份参考”或“结构按这份参考”，我会先跟你确认只借哪一层且只对本轮生效",
+        "",
+        "【手改进化、反悔与随时查口令】",
+        "- 改完保存即学习：在成品里改完按保存后说一句“我改好了”，我会自动抓差异请你勾选要不要记为长期习惯",
+        "- 随时反悔调整：直接说“修改上一题”“删除第 2 条习惯”或“回滚到上一个版本”",
+        "- 忘记怎么开口时：随时问一句“怎么发起写 PPT”或“怎么调用我的风格”，我会再发一遍这份速查给你",
+    ])
+
+    guard_res = output_guard.check_reply_text(guide_text)
+    return {
+        "status": "OK",
+        "profile_id": pid,
+        "active_mask": active_mid,
+        "scenario_count": len(scenarios),
+        "framework_count": len(frameworks),
+        "mask_count": len(masks),
+        "guard_ok": guard_res["ok"],
+        "guide_text": guide_text,
+    }
+
+
 def render_hub(wdir: Path, home_dir: Path) -> None:
     manifest = _load_json(wdir / "01-原始代表作归档" / ".archive-manifest.json", {"items": []})
     state = _load_json(wdir / ".wizard-state.json", {})
     pid = state.get("active_profile", "default")
     mid = state.get("active_mask", "default")
     pdir = _ensure_default_profile(home_dir, pid)
-    l1 = _load_json(pdir / "core_l1_planning.json", {"rules": []})
-    l2 = _load_json(pdir / "core_l2_content.json", {"rules": []})
+    l1 = _load_json(pdir / "core_l1_planning.json", {"rules": [], "scenarios": []})
+    l2 = _load_json(pdir / "core_l2_content.json", {"rules": [], "frameworks": []})
     m_data = _load_json(pdir / "masks" / f"{mid}.json", {"rules": [], "mask_name": "默认汇报风格"})
+    all_masks = [_load_json(mp, {}) for mp in sorted((pdir / "masks").glob("*.json"))]
 
     sample_lines = []
     for it in manifest["items"]:
@@ -1112,28 +1521,45 @@ def render_hub(wdir: Path, home_dir: Path) -> None:
     if not sample_lines:
         sample_lines.append("- （暂未归档代表作，请放入至少 1 份 .pptx 开始提炼）")
 
+    scenarios = l1.get("scenarios", [])
+    frameworks = [f for f in l2.get("frameworks", []) if f.get("status") != "dropped"]
+    sc_summary_lines = [
+        f"- **{sc.get('scenario_name')}**（样本 {sc.get('deck_count', 0)} 份 · 常见节奏：{sc.get('typical_skeleton', '')}）"
+        for sc in scenarios
+    ] or ["- （待提炼或由你补充主要汇报场景）"]
+
+    fw_summary_lines = [
+        f"- [{f.get('scenario_name', '综合')}] **{f.get('framework_name')}**（{f.get('confidence', 'medium')}置信 · 状态：{f.get('status')}）"
+        + (f"｜建议：{f['suggested_adjustment']}" if f.get("suggested_adjustment") else "")
+        for f in frameworks
+    ] or ["- （待提炼或从手改中积累）"]
+
+    mask_summary_lines = [
+        f"- **{m.get('mask_name', m.get('mask_id'))}**：{'独立通用' if m.get('binding_mode') == 'independent' else '默认绑定场景 ' + str(m.get('bound_scenarios', []))}"
+        for m in all_masks
+    ]
+
+    ug = generate_usage_guide(home_dir, wdir=wdir, profile_id=pid)
+
     hub_md = f"""# 00 · PPT 风格工坊操作中心
 
 - **当前步骤**：第 {state.get('step', 1)} / 6 步（{state.get('step_label', '准备就绪')}）
-- **当前激活档案**：{m_data.get('mask_name', mid)}
+- **当前激活皮肤**：{m_data.get('mask_name', mid)}
 - **已归档样本清单**：
 {chr(10).join(sample_lines)}
 
-## 已沉淀的个人习惯摘要
-- **第一层｜页面规划**：已确认 {len(l1.get('rules', []))} 条规律
-- **第二层｜内容组织**：已确认 {len(l2.get('rules', []))} 条规律
-- **第三层｜视觉样式**：已确认 {len(m_data.get('rules', []))} 条规律
+## 已沉淀的三层活资产摘要
+- **第一层｜写稿场景（{len(scenarios)} 个）** & 规划规则（{len(l1.get('rules', []))} 条）：
+{chr(10).join(sc_summary_lines)}
+- **第二层｜场景框架（{len(frameworks)} 套）** & 内容规则（{len(l2.get('rules', []))} 条）：
+{chr(10).join(fw_summary_lines)}
+- **第三层｜视觉母版皮肤（{len(all_masks)} 套）** & 排版规则（{len(m_data.get('rules', []))} 条）：
+{chr(10).join(mask_summary_lines)}
 
-## 日常 5 档怎么喊我写 PPT
-1. **整套代写**：“帮我基于这些资料做一套季度汇报 PPT”
-2. **只做规划**：“先帮我规划这份汇报分几页、每页讲什么”
-3. **只写内容**：“这几页大纲定了，帮我把每页具体内容组织出来”
-4. **定稿美化**：“文字已经定稿了，一字不改帮我按我的风格排版”
-5. **局部加页**：“在这份 PPT 第 5 页后新加两页，别的页别动”
-
-## 随时反悔与管理口令
-- `修改上一题` / `删除第 N 条习惯` / `回滚到上一个版本` / `恢复默认设置`
-- `保留写作习惯，只换一套新公司模板` / `把我的风格打包分享给同事`
+## 怎么喊我写 PPT（速查指南）
+```text
+{ug['guide_text']}
+```
 """
     (wdir / "00-操作中心.md").write_text(hub_md, encoding="utf-8")
 
@@ -1141,13 +1567,25 @@ def render_hub(wdir: Path, home_dir: Path) -> None:
 
 > 本说明书为您保留清晰的个人习惯摘要，可随时查阅或要求删改指定编号条目。
 
-## 一、页面规划习惯（第一层）
+## 一、写稿场景与页面规划习惯（第一层）
+### 1.1 主要写稿场景
+{chr(10).join(sc_summary_lines)}
+
+### 1.2 页面规划原则
 {chr(10).join(f"{r['rule_no']}. {r['text']}" for r in l1.get('rules', [])) or "（尚在积累中，可通过日常手改回流补充）"}
 
-## 二、单页内容组织习惯（第二层）
+## 二、单页内容框架与表达习惯（第二层）
+### 2.1 场景配套单页框架
+{chr(10).join(fw_summary_lines)}
+
+### 2.2 内容表达原则
 {chr(10).join(f"{r['rule_no']}. {r['text']}" for r in l2.get('rules', [])) or "（尚在积累中，可通过日常手改回流补充）"}
 
-## 三、视觉样式排版习惯（第三层 · {m_data.get('mask_name', mid)}）
+## 三、视觉母版与排版习惯（第三层 · {m_data.get('mask_name', mid)}）
+### 3.1 母版皮肤与绑定关系
+{chr(10).join(mask_summary_lines)}
+
+### 3.2 视觉排版原则
 {chr(10).join(f"{r['rule_no']}. {r['text']}" for r in m_data.get('rules', [])) or "（尚在积累中，可通过日常手改回流补充）"}
 """
     (wdir / "03-我的PPT风格说明书.md").write_text(guide_md, encoding="utf-8")
@@ -1168,6 +1606,9 @@ def main(argv: list[str] | None = None) -> int:
     p_sd = sub.add_parser("scan-dir")
     p_sd.add_argument("--dir", required=True)
 
+    p_tr = sub.add_parser("triage")
+    p_tr.add_argument("--path", action="append", required=True, help="目录或文件路径（可多次传入）")
+
     p_intake = sub.add_parser("intake")
     p_intake.add_argument("--workspace", required=True)
     p_intake.add_argument("--file", required=True)
@@ -1175,6 +1616,7 @@ def main(argv: list[str] | None = None) -> int:
     p_intake.add_argument("--slides", default=None)
     p_intake.add_argument("--external-toc", action="store_true")
     p_intake.add_argument("--copy-mode", choices=("copy", "reference"), default="copy")
+    p_intake.add_argument("--from-upload", action="store_true", help="来自对话上传的文件强制拷贝入库")
 
     p_scan = sub.add_parser("scan")
     p_scan.add_argument("--workspace", required=True)
@@ -1197,7 +1639,14 @@ def main(argv: list[str] | None = None) -> int:
     p_undo.add_argument("--workspace", required=True)
 
     p_prof = sub.add_parser("profile")
-    p_prof.add_argument("subaction", choices=("list", "switch", "split-mask", "swap-visual-shell", "promote-rule", "delete-rule", "rollback", "reset", "export-share"))
+    p_prof.add_argument(
+        "subaction",
+        choices=(
+            "list", "switch", "split-mask", "swap-visual-shell",
+            "promote-rule", "delete-rule", "rollback", "reset", "export-share",
+            "bind-mask", "confirm-scenario", "confirm-framework", "resolve-combo",
+        ),
+    )
     p_prof.add_argument("--profile", default=None)
     p_prof.add_argument("--mask", default=None)
     p_prof.add_argument("--label", default=None)
@@ -1205,6 +1654,19 @@ def main(argv: list[str] | None = None) -> int:
     p_prof.add_argument("--rule-text", default="")
     p_prof.add_argument("--rule-no", type=int, default=0)
     p_prof.add_argument("--out", default=None)
+    p_prof.add_argument("--scenarios", default="")
+    p_prof.add_argument("--independent", action="store_true")
+    p_prof.add_argument("--scenario-name", default="")
+    p_prof.add_argument("--scenario-id", default="")
+    p_prof.add_argument("--skeleton", default="")
+    p_prof.add_argument("--framework-id", default="")
+    p_prof.add_argument("--decision", choices=("accept", "adjust", "drop"), default="accept")
+    p_prof.add_argument("--note", default="")
+    p_prof.add_argument("--scenario", default="")
+
+    p_ug = sub.add_parser("usage-guide")
+    p_ug.add_argument("--workspace", default=None)
+    p_ug.add_argument("--profile", default=None)
 
     p_rh = sub.add_parser("render-hub")
     p_rh.add_argument("--workspace", required=True)
@@ -1232,9 +1694,17 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(res, ensure_ascii=False, indent=2))
         return 0 if res.get("status") != "ERROR" else 1
 
+    if args.cmd == "triage":
+        res = triage_paths(args.path)
+        print(json.dumps(res, ensure_ascii=False, indent=2))
+        return 0
+
     if args.cmd == "intake":
         wdir = _workshop_dir(args.workspace)
-        res = intake_file(wdir, args.file, args.category, args.slides, args.external_toc, home, copy_mode=args.copy_mode)
+        res = intake_file(
+            wdir, args.file, args.category, args.slides, args.external_toc, home,
+            copy_mode=args.copy_mode, from_upload=args.from_upload,
+        )
         print(json.dumps(res, ensure_ascii=False, indent=2))
         return 0 if res["status"] not in ("ERROR", "REJECTED") else 2
 
@@ -1266,6 +1736,11 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "profile":
         print(json.dumps(handle_profile(args, home), ensure_ascii=False, indent=2))
+        return 0
+
+    if args.cmd == "usage-guide":
+        wdir = _workshop_dir(args.workspace) if args.workspace else None
+        print(json.dumps(generate_usage_guide(home, wdir=wdir, profile_id=args.profile), ensure_ascii=False, indent=2))
         return 0
 
     if args.cmd == "render-hub":

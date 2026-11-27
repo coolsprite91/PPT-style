@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""snapshot_diff.py — 全局集中快照库、跨目录隐形编号认领、语义级手改比对与双通道一字不改核对锁（零第三方依赖）。
+"""snapshot_diff.py — 全局集中修订时间线快照库、多轮人机交替手改追踪与一字不改核对锁（V0.2.0，零第三方依赖）。
 
 子命令:
-  save-snapshot     出稿时将底稿留存在 ~/.ppt-style/snapshots/（>50MB 自动剥离音视频流）
-  diff              自动识别原地覆盖或改名移走的手改文件，过滤时间戳/WPS拆run/≤1pt抖动输出改动清单
+  save-snapshot     出稿时将底稿记入 revisions[] 时间线（>50MB 自动剥离音视频流）
+  diff              支持 latest（仅最新一轮增量）与 cumulative_human（跨多轮纯人工累计汇总）
+  mark-reviewed     推进用户已审核检查点，避免后续继续手改时重复报告旧改动
+  history           查看某份文档的多轮修订时间线
   verify-text-lock  第3层“一字不改核对锁”：允许美观分段，但对数字/单位/金额/百分比/符号零容忍全等校验
 """
 
@@ -177,7 +179,6 @@ def extract_semantic_slides(pptx_path: Path) -> list[SemanticSlide]:
             if root is None:
                 continue
 
-            # Read slide rels for notes & images
             parent, name = sld_path.rsplit("/", 1)
             rel_xml = _read_xml(zf, f"{parent}/_rels/{name}.rels")
             notes_path = ""
@@ -222,14 +223,12 @@ def extract_semantic_slides(pptx_path: Path) -> list[SemanticSlide]:
                     continue
                 sp_paras: list[str] = []
                 for p_el in tx.findall(f"{{{NS['a']}}}p"):
-                    # Concatenate all <a:t> inside paragraph to ignore WPS/Office run fragmentation!
                     p_txt = _clean_text("".join(t.text or "" for t in p_el.findall(f".//{{{NS['a']}}}t")))
                     if p_txt:
                         sp_paras.append(p_txt)
                     for rpr in p_el.findall(f".//{{{NS['a']}}}rPr"):
                         if "sz" in rpr.attrib:
                             try:
-                                # Quantize to 0.5pt to ignore minor rendering jitter
                                 font_sizes.add(round(int(rpr.attrib["sz"]) / 100.0 * 2) / 2.0)
                             except ValueError:
                                 pass
@@ -308,7 +307,6 @@ def semantic_fingerprint(slides: list[SemanticSlide]) -> str:
             "title": _norm_text(s.title),
             "paragraphs": [_norm_text(p) for p in s.paragraphs],
             "font_sizes": s.font_sizes,
-            # Quantize coordinates to 2pt bins so <=1pt jitter never flips fingerprint
             "boxes": [[round(v / 2.0) * 2 for v in b] for b in s.shape_boxes_pt],
             "tables": s.table_count,
             "pics": s.pic_hashes,
@@ -321,7 +319,7 @@ def semantic_fingerprint(slides: list[SemanticSlide]) -> str:
 
 
 def _copy_snapshot_file(src: Path, dst: Path) -> bool:
-    """复制底稿到快照库；仅当 >50MB 且实际包含音视频流时执行剥离，避免无谓重压缩高分辨率纯图稿件。"""
+    """复制底稿到快照库；仅当 >50MB 且实际包含音视频流时执行剥离。"""
     size_mb = src.stat().st_size / (1024 * 1024)
     if size_mb <= 50.0:
         shutil.copy2(src, dst)
@@ -347,13 +345,62 @@ def _copy_snapshot_file(src: Path, dst: Path) -> bool:
     return stripped
 
 
+def _load_index(index_path: Path) -> dict[str, Any]:
+    if index_path.is_file():
+        return json.loads(index_path.read_text(encoding="utf-8"))
+    return {"docs": {}, "paths": {}}
+
+
+def _save_index(index_path: Path, index: dict[str, Any]) -> None:
+    index_path.parent.mkdir(parents=True, exist_ok=True)
+    index_path.write_text(json.dumps(index, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _ensure_revisions_migrated(doc_entry: dict[str, Any]) -> list[dict[str, Any]]:
+    revs = doc_entry.get("revisions")
+    if isinstance(revs, list) and revs:
+        return revs
+    if doc_entry.get("latest_snapshot"):
+        migrated = [{
+            "rev_id": "R1",
+            "role": "ai_build",
+            "snapshot_path": doc_entry["latest_snapshot"],
+            "semantic_fingerprint": doc_entry.get("semantic_fingerprint", ""),
+            "parent_rev_id": None,
+            "source_path": doc_entry.get("source_path", ""),
+            "source_label": doc_entry.get("source_label", "ai_generated"),
+            "saved_at": doc_entry.get("saved_at", ""),
+            "reviewed": False,
+        }]
+        doc_entry["revisions"] = migrated
+        doc_entry["latest_rev_id"] = "R1"
+        return migrated
+    doc_entry["revisions"] = []
+    return doc_entry["revisions"]
+
+
+def _resolve_doc_id(src: Path | None, explicit_doc_id: str | None, index: dict[str, Any]) -> str | None:
+    if explicit_doc_id and explicit_doc_id in index.get("docs", {}):
+        return explicit_doc_id
+    if src is not None and src.is_file():
+        embedded = extract_doc_id(src)
+        if embedded and embedded in index.get("docs", {}):
+            return embedded
+        by_path = index.get("paths", {}).get(str(src))
+        if by_path and by_path in index.get("docs", {}):
+            return by_path
+    return explicit_doc_id or (extract_doc_id(src) if (src is not None and src.is_file()) else None)
+
+
 def save_snapshot(
     pptx_path_str: str,
     snapshot_root: str | None = None,
     doc_id: str | None = None,
     source_label: str = "ai_generated",
+    role: str = "ai_build",
+    parent_rev_id: str | None = None,
 ) -> dict[str, Any]:
-    """保存只读快照到全局集中目录，并登记文档隐形编号与原始路径索引。"""
+    """保存只读快照到全局修订时间线，并登记文档隐形编号与原始路径索引。"""
     src = Path(pptx_path_str).resolve()
     if not src.is_file():
         return {"status": "ERROR", "message": f"找不到文件：{src}"}
@@ -361,34 +408,176 @@ def save_snapshot(
     base_root = Path(snapshot_root) if snapshot_root else (default_ppt_style_home() / "snapshots")
     base_root.mkdir(parents=True, exist_ok=True)
     index_path = base_root / "index.json"
-    index: dict[str, Any] = json.loads(index_path.read_text(encoding="utf-8")) if index_path.is_file() else {"docs": {}, "paths": {}}
+    index = _load_index(index_path)
 
     detected_id = doc_id or extract_doc_id(src) or index["paths"].get(str(src)) or uuid.uuid4().hex[:12]
     doc_dir = base_root / detected_id
     doc_dir.mkdir(parents=True, exist_ok=True)
 
+    doc_entry = index["docs"].get(detected_id, {})
+    revisions = _ensure_revisions_migrated(doc_entry) if doc_entry else []
+    rev_id = f"R{len(revisions) + 1}"
+    eff_parent = parent_rev_id if parent_rev_id is not None else doc_entry.get("latest_rev_id")
+
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-    snap_file = doc_dir / f"snap-{ts}.pptx"
+    snap_file = doc_dir / f"snap-{rev_id}-{ts}.pptx"
     stripped = _copy_snapshot_file(src, snap_file)
 
     slides = extract_semantic_slides(src)
     sem_fp = semantic_fingerprint(slides)
+    now_iso = datetime.now().isoformat(timespec="seconds")
+
+    rev_entry = {
+        "rev_id": rev_id,
+        "role": role,
+        "snapshot_path": str(snap_file),
+        "semantic_fingerprint": sem_fp,
+        "parent_rev_id": eff_parent,
+        "source_path": str(src),
+        "source_label": source_label,
+        "saved_at": now_iso,
+        "reviewed": False,
+    }
+    revisions.append(rev_entry)
 
     meta = {
         "doc_id": detected_id,
         "latest_snapshot": str(snap_file),
+        "latest_rev_id": rev_id,
+        "reviewed_rev_id": doc_entry.get("reviewed_rev_id"),
         "source_path": str(src),
         "source_name": src.name,
         "source_label": source_label,
         "semantic_fingerprint": sem_fp,
         "slide_count": len(slides),
         "media_stripped": stripped,
-        "saved_at": datetime.now().isoformat(timespec="seconds"),
+        "saved_at": now_iso,
+        "revisions": revisions,
     }
     index["docs"][detected_id] = meta
     index["paths"][str(src)] = detected_id
-    index_path.write_text(json.dumps(index, ensure_ascii=False, indent=2), encoding="utf-8")
-    return {"status": "SAVED", **meta}
+    _save_index(index_path, index)
+    return {
+        "status": "SAVED",
+        "rev_id": rev_id,
+        "parent_rev_id": eff_parent,
+        "revision_count": len(revisions),
+        **meta,
+    }
+
+
+def capture_human_revision_if_changed(
+    pptx_path_str: str,
+    snapshot_root: str | None = None,
+    doc_id: str | None = None,
+) -> dict[str, Any]:
+    """在 AI 续改前检测文件是否已有手工修改；若有，先补抓一条 human_edit 快照。"""
+    src = Path(pptx_path_str).resolve()
+    if not src.is_file():
+        return {"captured": False, "reason": "FILE_NOT_FOUND"}
+
+    base_root = Path(snapshot_root) if snapshot_root else (default_ppt_style_home() / "snapshots")
+    index_path = base_root / "index.json"
+    if not index_path.is_file():
+        return {"captured": False, "reason": "NO_INDEX"}
+
+    index = _load_index(index_path)
+    found_id = _resolve_doc_id(src, doc_id, index)
+    if not found_id or found_id not in index.get("docs", {}):
+        return {"captured": False, "reason": "NO_SNAPSHOT_FOUND"}
+
+    doc_entry = index["docs"][found_id]
+    _ensure_revisions_migrated(doc_entry)
+    cur_fp = semantic_fingerprint(extract_semantic_slides(src))
+    if cur_fp == doc_entry.get("semantic_fingerprint"):
+        return {
+            "captured": False,
+            "doc_id": found_id,
+            "latest_rev_id": doc_entry.get("latest_rev_id"),
+        }
+
+    saved = save_snapshot(
+        str(src),
+        snapshot_root=str(base_root),
+        doc_id=found_id,
+        source_label="human_edit_auto",
+        role="human_edit",
+        parent_rev_id=doc_entry.get("latest_rev_id"),
+    )
+    return {
+        "captured": True,
+        "doc_id": found_id,
+        "rev_id": saved["rev_id"],
+        "parent_rev_id": saved["parent_rev_id"],
+        "snapshot_path": saved["latest_snapshot"],
+    }
+
+
+def mark_reviewed(
+    pptx_path_str: str | None = None,
+    doc_id: str | None = None,
+    snapshot_root: str | None = None,
+) -> dict[str, Any]:
+    """推进已审核检查点，防止后续多轮手改重复报告已确认过的旧差异。"""
+    base_root = Path(snapshot_root) if snapshot_root else (default_ppt_style_home() / "snapshots")
+    index_path = base_root / "index.json"
+    if not index_path.is_file():
+        return {"status": "NO_SNAPSHOT_FOUND", "human_hint": "暂时没有找到底稿记录。"}
+
+    src = Path(pptx_path_str).resolve() if pptx_path_str else None
+    if src is not None and src.is_file():
+        capture_human_revision_if_changed(str(src), snapshot_root=str(base_root), doc_id=doc_id)
+
+    index = _load_index(index_path)
+    found_id = _resolve_doc_id(src, doc_id, index)
+    if not found_id or found_id not in index.get("docs", {}):
+        return {"status": "NO_SNAPSHOT_FOUND", "human_hint": "没有找到对应的修订时间线记录。"}
+
+    doc_entry = index["docs"][found_id]
+    revs = _ensure_revisions_migrated(doc_entry)
+    target_rev = None
+    for rev in reversed(revs):
+        if rev.get("role") == "human_edit":
+            target_rev = rev
+            break
+    if target_rev is None and revs:
+        target_rev = revs[-1]
+    if target_rev is None:
+        return {"status": "NO_REVISION_TO_MARK", "doc_id": found_id}
+
+    target_rev["reviewed"] = True
+    doc_entry["reviewed_rev_id"] = target_rev["rev_id"]
+    _save_index(index_path, index)
+    return {
+        "status": "MARKED_REVIEWED",
+        "doc_id": found_id,
+        "reviewed_rev_id": target_rev["rev_id"],
+    }
+
+
+def get_history(
+    pptx_path_str: str | None = None,
+    doc_id: str | None = None,
+    snapshot_root: str | None = None,
+) -> dict[str, Any]:
+    base_root = Path(snapshot_root) if snapshot_root else (default_ppt_style_home() / "snapshots")
+    index_path = base_root / "index.json"
+    if not index_path.is_file():
+        return {"status": "NO_SNAPSHOT_FOUND", "revisions": []}
+    index = _load_index(index_path)
+    src = Path(pptx_path_str).resolve() if pptx_path_str else None
+    found_id = _resolve_doc_id(src, doc_id, index)
+    if not found_id or found_id not in index.get("docs", {}):
+        return {"status": "NO_SNAPSHOT_FOUND", "revisions": []}
+    doc_entry = index["docs"][found_id]
+    revs = _ensure_revisions_migrated(doc_entry)
+    return {
+        "status": "OK",
+        "doc_id": found_id,
+        "latest_rev_id": doc_entry.get("latest_rev_id"),
+        "reviewed_rev_id": doc_entry.get("reviewed_rev_id"),
+        "revisions": revs,
+    }
 
 
 def _slide_similarity(a: SemanticSlide, h: SemanticSlide) -> float:
@@ -447,49 +636,10 @@ def _significant_box_shift(boxes_a: list[tuple[float, float, float, float]], box
     return False
 
 
-def diff_against_snapshot(
-    human_path_str: str,
-    base_snapshot_str: str | None = None,
-    snapshot_root: str | None = None,
-) -> dict[str, Any]:
-    """对用户原地保存或改名移动的手改文件进行语义级差异提取。"""
-    hum_path = Path(human_path_str).resolve()
-    if not hum_path.is_file():
-        return {"status": "ERROR", "message": f"找不到文件：{hum_path}"}
-
-    base_root = Path(snapshot_root) if snapshot_root else (default_ppt_style_home() / "snapshots")
-    index_path = base_root / "index.json"
-    snap_path: Path | None = Path(base_snapshot_str) if base_snapshot_str else None
-    found_doc_id = extract_doc_id(hum_path)
-
-    if snap_path is None and index_path.is_file():
-        index = json.loads(index_path.read_text(encoding="utf-8"))
-        if found_doc_id and found_doc_id in index.get("docs", {}):
-            snap_path = Path(index["docs"][found_doc_id]["latest_snapshot"])
-        elif str(hum_path) in index.get("paths", {}):
-            did = index["paths"][str(hum_path)]
-            if did in index.get("docs", {}):
-                found_doc_id = did
-                snap_path = Path(index["docs"][did]["latest_snapshot"])
-
-    if snap_path is None or not snap_path.is_file():
-        return {
-            "status": "NO_SNAPSHOT_FOUND",
-            "human_hint": "没有找到这份 PPT 对应的生成底稿记录，请告诉我原始初稿是哪一个文件，我帮你直接比对。",
-        }
-
-    base_slides = extract_semantic_slides(snap_path)
-    hum_slides = extract_semantic_slides(hum_path)
-    base_fp = semantic_fingerprint(base_slides)
-    hum_fp = semantic_fingerprint(hum_slides)
-
-    if base_fp == hum_fp:
-        return {
-            "status": "NO_CHANGES_DETECTED",
-            "doc_id": found_doc_id,
-            "human_hint": "还没有读到新的修改记录，请先确认在 PPT 软件里按了保存（Ctrl+S）后再告诉我。",
-        }
-
+def _diff_two_slides_lists(
+    base_slides: list[SemanticSlide],
+    hum_slides: list[SemanticSlide],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     aligned = _align_slides(base_slides, hum_slides)
     changes: list[dict[str, Any]] = []
     structural_deletions: list[dict[str, Any]] = []
@@ -562,14 +712,10 @@ def diff_against_snapshot(
                     "likely_category": "素材调整",
                 })
 
-    if not changes:
-        return {
-            "status": "NO_CHANGES_DETECTED",
-            "doc_id": found_doc_id,
-            "human_hint": "对比后未发现实质文字、字号或明显排版变化（仅保存格式微调），无需额外确认。",
-        }
+    return changes, structural_deletions
 
-    # Build user checklist always starting with 0 (anti-harassment emergency override)
+
+def _build_checklist(changes: list[dict[str, Any]]) -> list[dict[str, Any]]:
     checklist = [
         {
             "item_no": 0,
@@ -584,16 +730,166 @@ def diff_against_snapshot(
             "slide_ref": ch["slide_ref"],
             "summary": ch["summary"],
         })
+    return checklist
+
+
+def diff_against_snapshot(
+    human_path_str: str,
+    base_snapshot_str: str | None = None,
+    snapshot_root: str | None = None,
+    mode: str = "latest",
+    mark_reviewed_after: bool = False,
+) -> dict[str, Any]:
+    """对用户手改文件进行语义级差异提取：支持 latest 增量对比与 cumulative_human 多轮纯人工累计对比。"""
+    hum_path = Path(human_path_str).resolve()
+    if not hum_path.is_file():
+        return {"status": "ERROR", "message": f"找不到文件：{hum_path}"}
+
+    base_root = Path(snapshot_root) if snapshot_root else (default_ppt_style_home() / "snapshots")
+    index_path = base_root / "index.json"
+    index = _load_index(index_path)
+    found_doc_id = _resolve_doc_id(hum_path, None, index)
+
+    if mode == "cumulative_human":
+        if not found_doc_id or found_id_missing(found_doc_id, index):
+            return {
+                "status": "NO_SNAPSHOT_FOUND",
+                "human_hint": "没有找到这份 PPT 对应的多轮修订时间线，请告诉我原始初稿是哪一个文件，我帮你直接比对。",
+            }
+        # 确保当前终稿若未入链先自动补抓
+        capture_human_revision_if_changed(str(hum_path), snapshot_root=str(base_root), doc_id=found_doc_id)
+        index = _load_index(index_path)
+        doc_entry = index["docs"][found_doc_id]
+        revs = _ensure_revisions_migrated(doc_entry)
+        rev_map = {r["rev_id"]: r for r in revs}
+
+        rounds: list[dict[str, Any]] = []
+        all_changes: list[dict[str, Any]] = []
+        all_deletions: list[dict[str, Any]] = []
+        excluded_ai: list[dict[str, Any]] = []
+
+        for r in revs:
+            if r.get("role") in ("ai_build", "ai_revise"):
+                excluded_ai.append({"rev_id": r["rev_id"], "role": r["role"], "saved_at": r.get("saved_at", "")})
+                continue
+            if r.get("role") == "human_edit" and r.get("parent_rev_id") in rev_map:
+                parent_r = rev_map[r["parent_rev_id"]]
+                p_snap = Path(parent_r["snapshot_path"])
+                c_snap = Path(r["snapshot_path"])
+                if not p_snap.is_file() or not c_snap.is_file():
+                    continue
+                b_slides = extract_semantic_slides(p_snap)
+                h_slides = extract_semantic_slides(c_snap)
+                chs, dels = _diff_two_slides_lists(b_slides, h_slides)
+                if chs or dels:
+                    rounds.append({
+                        "rev_id": r["rev_id"],
+                        "from_rev_id": parent_r["rev_id"],
+                        "saved_at": r.get("saved_at", ""),
+                        "changes": chs,
+                        "structural_deletions": dels,
+                    })
+                    all_changes.extend(chs)
+                    all_deletions.extend(dels)
+
+        if not all_changes:
+            return {
+                "status": "NO_CHANGES_DETECTED",
+                "mode": "cumulative_human",
+                "doc_id": found_doc_id,
+                "excluded_ai_revisions": excluded_ai,
+                "human_hint": "整条修订链上未发现纯人工改动，无需额外确认。",
+            }
+
+        return {
+            "status": "CHANGES_DETECTED",
+            "mode": "cumulative_human",
+            "doc_id": found_doc_id,
+            "human_rounds_count": len(rounds),
+            "rounds": rounds,
+            "excluded_ai_revisions": excluded_ai,
+            "total_changes": len(all_changes),
+            "changes": all_changes,
+            "structural_deletions": all_deletions,
+            "confirmation_checklist": _build_checklist(all_changes),
+        }
+
+    # mode == "latest"
+    snap_path: Path | None = Path(base_snapshot_str) if base_snapshot_str else None
+    base_rev_id: str | None = None
+    revision_count = 0
+
+    if snap_path is None and found_doc_id and found_doc_id in index.get("docs", {}):
+        doc_entry = index["docs"][found_doc_id]
+        revs = _ensure_revisions_migrated(doc_entry)
+        revision_count = len(revs)
+        reviewed_id = doc_entry.get("reviewed_rev_id")
+        last_ai_idx = -1
+        for i, r in enumerate(revs):
+            if r.get("role") in ("ai_build", "ai_revise"):
+                last_ai_idx = i
+        rev_idx = next((i for i, r in enumerate(revs) if r.get("rev_id") == reviewed_id), -1)
+        if reviewed_id and rev_idx >= last_ai_idx and rev_idx >= 0:
+            snap_path = Path(revs[rev_idx]["snapshot_path"])
+            base_rev_id = reviewed_id
+        else:
+            snap_path = Path(doc_entry["latest_snapshot"])
+            base_rev_id = doc_entry.get("latest_rev_id")
+
+    if snap_path is None or not snap_path.is_file():
+        return {
+            "status": "NO_SNAPSHOT_FOUND",
+            "human_hint": "没有找到这份 PPT 对应的生成底稿记录，请告诉我原始初稿是哪一个文件，我帮你直接比对。",
+        }
+
+    base_slides = extract_semantic_slides(snap_path)
+    hum_slides = extract_semantic_slides(hum_path)
+    base_fp = semantic_fingerprint(base_slides)
+    hum_fp = semantic_fingerprint(hum_slides)
+
+    if base_fp == hum_fp:
+        return {
+            "status": "NO_CHANGES_DETECTED",
+            "mode": "latest",
+            "doc_id": found_doc_id,
+            "base_rev_id": base_rev_id,
+            "revision_count": revision_count,
+            "human_hint": "还没有读到新的修改记录，请先确认在 PPT 软件里按了保存（Ctrl+S）后再告诉我。",
+        }
+
+    changes, structural_deletions = _diff_two_slides_lists(base_slides, hum_slides)
+    if not changes:
+        return {
+            "status": "NO_CHANGES_DETECTED",
+            "mode": "latest",
+            "doc_id": found_doc_id,
+            "base_rev_id": base_rev_id,
+            "revision_count": revision_count,
+            "human_hint": "对比后未发现实质文字、字号或明显排版变化（仅保存格式微调），无需额外确认。",
+        }
+
+    reviewed_rev_id = None
+    if mark_reviewed_after and found_doc_id:
+        mr = mark_reviewed(str(hum_path), doc_id=found_doc_id, snapshot_root=str(base_root))
+        reviewed_rev_id = mr.get("reviewed_rev_id")
 
     return {
         "status": "CHANGES_DETECTED",
+        "mode": "latest",
         "doc_id": found_doc_id,
+        "base_rev_id": base_rev_id,
+        "reviewed_rev_id": reviewed_rev_id,
+        "revision_count": revision_count,
         "snapshot_used": str(snap_path),
         "total_changes": len(changes),
         "changes": changes,
         "structural_deletions": structural_deletions,
-        "confirmation_checklist": checklist,
+        "confirmation_checklist": _build_checklist(changes),
     }
+
+
+def found_id_missing(doc_id: str | None, index: dict[str, Any]) -> bool:
+    return not doc_id or doc_id not in index.get("docs", {})
 
 
 def _extract_numeric_tokens(text: str) -> list[str]:
@@ -655,7 +951,7 @@ def verify_text_lock(
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="PPT-style 全局快照与语义级手改比对工具")
+    parser = argparse.ArgumentParser(description="PPT-style 全局修订时间线快照与手改比对工具")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_save = sub.add_parser("save-snapshot", help="保存底稿快照")
@@ -663,11 +959,24 @@ def main(argv: list[str] | None = None) -> int:
     p_save.add_argument("--snapshot-root", default=None)
     p_save.add_argument("--doc-id", default=None)
     p_save.add_argument("--label", default="ai_generated")
+    p_save.add_argument("--role", choices=("ai_build", "human_edit", "ai_revise"), default="ai_build")
 
     p_diff = sub.add_parser("diff", help="比对原地或另存修改稿与底稿差异")
     p_diff.add_argument("--pptx", required=True, help="用户修改后的 PPTX 路径")
     p_diff.add_argument("--base", default=None, help="显式指定底稿路径（可选，默认按隐形编号找回）")
     p_diff.add_argument("--snapshot-root", default=None)
+    p_diff.add_argument("--mode", choices=("latest", "cumulative_human"), default="latest")
+    p_diff.add_argument("--mark-reviewed", action="store_true", help="对比确认后推进已审检查点")
+
+    p_mark = sub.add_parser("mark-reviewed", help="把当前手改标记为已审检查点")
+    p_mark.add_argument("--pptx", default=None)
+    p_mark.add_argument("--doc-id", default=None)
+    p_mark.add_argument("--snapshot-root", default=None)
+
+    p_hist = sub.add_parser("history", help="查看多轮修订时间线")
+    p_hist.add_argument("--pptx", default=None)
+    p_hist.add_argument("--doc-id", default=None)
+    p_hist.add_argument("--snapshot-root", default=None)
 
     p_lock = sub.add_parser("verify-text-lock", help="第3层定稿纯排版一字不改核对锁")
     p_lock.add_argument("--source-json", required=True, help="包含 source_texts 与可选 exempt_blocks 的 JSON")
@@ -675,14 +984,30 @@ def main(argv: list[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
     if args.cmd == "save-snapshot":
-        res = save_snapshot(args.pptx, snapshot_root=args.snapshot_root, doc_id=args.doc_id, source_label=args.label)
+        res = save_snapshot(args.pptx, snapshot_root=args.snapshot_root, doc_id=args.doc_id, source_label=args.label, role=args.role)
         print(json.dumps(res, ensure_ascii=False, indent=2))
         return 0 if res.get("status") == "SAVED" else 1
 
     if args.cmd == "diff":
-        res = diff_against_snapshot(args.pptx, base_snapshot_str=args.base, snapshot_root=args.snapshot_root)
+        res = diff_against_snapshot(
+            args.pptx,
+            base_snapshot_str=args.base,
+            snapshot_root=args.snapshot_root,
+            mode=args.mode,
+            mark_reviewed_after=args.mark_reviewed,
+        )
         print(json.dumps(res, ensure_ascii=False, indent=2))
         return 0
+
+    if args.cmd == "mark-reviewed":
+        res = mark_reviewed(args.pptx, doc_id=args.doc_id, snapshot_root=args.snapshot_root)
+        print(json.dumps(res, ensure_ascii=False, indent=2))
+        return 0 if res.get("status") == "MARKED_REVIEWED" else 1
+
+    if args.cmd == "history":
+        res = get_history(args.pptx, doc_id=args.doc_id, snapshot_root=args.snapshot_root)
+        print(json.dumps(res, ensure_ascii=False, indent=2))
+        return 0 if res.get("status") == "OK" else 1
 
     if args.cmd == "verify-text-lock":
         data = json.loads(Path(args.source_json).read_text(encoding="utf-8"))

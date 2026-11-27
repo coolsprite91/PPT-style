@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""install.py — PPT-style 多端全嗅探全局安装器（机读目录名统一小写 ppt-style）。
+"""install.py — PPT-style 多端全嗅探全局安装器（V0.2.0，机读目录名统一小写 ppt-style）。
 
 铁律:
   1. 机读技能目录名统一为全小写 `ppt-style`，兼容所有严格校验小写命名的桌面 AI 客户端。
-  2. 未显式指定 `--target-dir` 时，自动扫描本机已存在的主流客户端全局目录并同步写入；
-     若一台都未探测到，回落至 ~/.agents/skills 并发出明确告警提示由 AI 自查真实目录。
-  3. 发现同名旧目录或旧版大写 `PPT-style` 时，一律移入 ~/.ppt-style/backups/<timestamp>/，
+  2. 未显式指定 `--target-dir` 时，自动扫描本机已存在的主流客户端全局目录并同步写入
+     （包含 ~/.gemini/config/skills/ 软链同步支持）；若一台都未探测到，回落至 ~/.agents/skills。
+  3. 发现同名旧目录、旧软链或旧版大写 `PPT-style` 时，一律移入 ~/.ppt-style/backups/<timestamp>/，
      绝不把备份目录留在全局 skills/ 同级目录下（防止客户端误扫描并冲突触发）。
 """
 
@@ -37,6 +37,7 @@ DIST_DIRS = ("references", "scripts")
 # (客户端根目录相对路径, 对应的全局 skills 子目录相对路径, 客户端展示名称)
 CLIENT_DIR_SPECS: tuple[tuple[tuple[str, ...], tuple[str, ...], str], ...] = (
     ((".agents",), (".agents", "skills"), "通用 Agents (~/.agents/skills)"),
+    ((".gemini", "config"), (".gemini", "config", "skills"), "Antigravity / Gemini Config"),
     ((".gemini", "antigravity"), (".gemini", "antigravity", "skills"), "Antigravity"),
     ((".claude",), (".claude", "skills"), "Claude Code"),
     ((".cursor",), (".cursor", "skills"), "Cursor"),
@@ -78,26 +79,76 @@ def detect_client_skill_dirs(user_home: Path) -> list[tuple[Path, str]]:
 
 
 def _matching_skill_entries(target_dir: Path) -> list[Path]:
-    """按实际磁盘目录名匹配 ppt-style 或历史旧名，避免 Windows 大小写不敏感导致重复匹配。"""
+    """按实际磁盘目录/软链名匹配 ppt-style 或历史旧名，避免大小写不敏感导致重复匹配。"""
     if not target_dir.is_dir():
         return []
     targets_set = {SKILL_NAME, *LEGACY_SKILL_NAMES}
     return [entry for entry in target_dir.iterdir() if entry.name in targets_set]
 
 
-def _install_into_single_dir(target_dir: Path, home_dir: Path) -> tuple[str, list[str]]:
+def _should_symlink_from_agents(target_dir: Path, agents_dest: Path | None) -> bool:
+    if agents_dest is None or not agents_dest.is_dir():
+        return False
+    if target_dir.resolve() == agents_dest.parent.resolve():
+        return False
+    if not target_dir.is_dir():
+        return False
+    try:
+        entries = list(target_dir.iterdir())
+    except Exception:
+        return False
+    if not entries:
+        return False
+    for entry in entries:
+        if entry.is_symlink():
+            try:
+                raw_target = os.readlink(entry)
+                if ".agents" in raw_target or str(agents_dest.parent) in str(entry.resolve()):
+                    return True
+            except Exception:
+                continue
+    return False
+
+
+def _move_existing_to_backup(existing_path: Path, backups_root: Path, suffix: str = "") -> str:
+    backups_root.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    b_name = f"{existing_path.name}{suffix}-{ts}"
+    b_dest = backups_root / b_name
+    if existing_path.is_symlink():
+        # Preserve symlink target record then remove symlink safely
+        try:
+            target_str = os.readlink(existing_path)
+        except Exception:
+            target_str = ""
+        (backups_root / f"{b_name}.symlink.txt").write_text(target_str, encoding="utf-8")
+        existing_path.unlink()
+        return str(backups_root / f"{b_name}.symlink.txt")
+    shutil.move(str(existing_path), str(b_dest))
+    return str(b_dest)
+
+
+def _install_into_single_dir(
+    target_dir: Path,
+    home_dir: Path,
+    agents_dest: Path | None = None,
+) -> tuple[str, list[str], str]:
     target_dir.mkdir(parents=True, exist_ok=True)
     backups: list[str] = []
     backups_root = home_dir / "backups"
 
     for existing_path in _matching_skill_entries(target_dir):
-        backups_root.mkdir(parents=True, exist_ok=True)
-        ts = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-        b_dest = backups_root / f"{existing_path.name}-{ts}"
-        shutil.move(str(existing_path), str(b_dest))
-        backups.append(str(b_dest))
+        backups.append(_move_existing_to_backup(existing_path, backups_root))
 
     dest = target_dir / SKILL_NAME
+    if _should_symlink_from_agents(target_dir, agents_dest):
+        try:
+            rel_target = os.path.relpath(str(agents_dest), str(target_dir))
+            dest.symlink_to(rel_target)
+            return str(dest), backups, "symlink"
+        except OSError:
+            pass
+
     dest.mkdir(parents=True, exist_ok=True)
     for fname in DIST_FILES:
         src_f = SKILL_SOURCE / fname
@@ -112,7 +163,7 @@ def _install_into_single_dir(target_dir: Path, home_dir: Path) -> tuple[str, lis
     if bundled.is_dir():
         shutil.copytree(bundled, dest / "bundled-profile")
 
-    return str(dest), backups
+    return str(dest), backups, "copy"
 
 
 def install_skill(
@@ -131,29 +182,38 @@ def install_skill(
             fallback_used = True
             targets = [(u_home / ".agents" / "skills", "默认通用目录 (~/.agents/skills)")]
 
+    # Ensure ~/.agents/skills runs first so downstream symlink-mirroring dirs can link to it
+    agents_dir = u_home / ".agents" / "skills"
+    targets_sorted = sorted(targets, key=lambda item: (0 if item[0] == agents_dir else 1))
+
     installed_paths: list[str] = []
     matched_clients: list[str] = []
+    install_modes: list[str] = []
     all_backups: list[str] = []
+    agents_dest: Path | None = None
 
-    for t_dir, label in targets:
-        dest_str, backups = _install_into_single_dir(t_dir, home_dir)
+    for t_dir, label in targets_sorted:
+        dest_str, backups, mode = _install_into_single_dir(t_dir, home_dir, agents_dest=agents_dest)
+        if t_dir == agents_dir:
+            agents_dest = Path(dest_str)
         installed_paths.append(dest_str)
         matched_clients.append(label)
+        install_modes.append(mode)
         all_backups.extend(backups)
 
     version = (
         (SKILL_SOURCE / "VERSION").read_text(encoding="utf-8").strip()
         if (SKILL_SOURCE / "VERSION").is_file()
-        else "V0.1.2"
+        else "V0.2.0"
     )
 
     hint_lines = [
         f"已成功安装 PPT-style（机读目录 `{SKILL_NAME}`，版本 {version}）到 {len(installed_paths)} 个位置：",
-        *[f"  - {lbl}: {p}" for lbl, p in zip(matched_clients, installed_paths)],
+        *[f"  - {lbl} ({md}): {p}" for lbl, md, p in zip(matched_clients, install_modes, installed_paths)],
     ]
     if fallback_used:
-        hint_lines.append("【注意】未自动探测到已知客户端目录，已先装入通用目录；如果新开对话喊不出来，请把仓库链接发给你的 AI 让它装到自己实际读取的目录。")
-    hint_lines.append("请【新开一个对话窗口】（或重启软件），直接发送 `检查 PPT-style 是否就绪` 即可 3 秒验证是否真的加载成功。")
+        hint_lines.append("【注意】未自动探测到已知客户端目录，已先装入通用目录；如果新开对话喊不出来，请把仓库链接发给你的 AI 让它查明实际加载路径后再装。")
+    hint_lines.append("请【新开一个对话窗口】（或重启软件），直接发送 `检查 PPT-style 是否就绪` 做 3 秒验活；若查不到，请让当前 AI 对照已加载技能目录排查加载方式。")
 
     return {
         "status": "INSTALLED",
@@ -162,6 +222,7 @@ def install_skill(
         "installed_paths": installed_paths,
         "installed_path": installed_paths[0],
         "matched_clients": matched_clients,
+        "install_modes": install_modes,
         "fallback_used": fallback_used,
         "backup_paths": all_backups,
         "backup_path": all_backups[0] if all_backups else None,
@@ -189,12 +250,9 @@ def uninstall_skill(
 
     for t_dir, _label in targets:
         for dest in _matching_skill_entries(t_dir):
-            backups_root.mkdir(parents=True, exist_ok=True)
-            ts = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-            b_dest = backups_root / f"{dest.name}-uninstalled-{ts}"
-            shutil.move(str(dest), str(b_dest))
+            b_rec = _move_existing_to_backup(dest, backups_root, suffix="-uninstalled")
             removed_from.append(str(dest))
-            backups.append(str(b_dest))
+            backups.append(b_rec)
 
     if not removed_from:
         return {"status": "NOT_INSTALLED", "human_hint": "未在已探测目录检测到已安装的 ppt-style 技能。"}
@@ -213,10 +271,16 @@ def check_status(target_dir: Path | None, user_home: Path | None = None) -> dict
     found: list[dict[str, Any]] = []
     for t_dir, label in targets:
         for dest in _matching_skill_entries(t_dir):
-            if dest.is_dir():
+            if dest.is_dir() or dest.is_symlink():
                 ver_file = dest / "VERSION"
                 ver = ver_file.read_text(encoding="utf-8").strip() if ver_file.is_file() else "unknown"
-                found.append({"client": label, "dir_name": dest.name, "installed_path": str(dest), "version": ver})
+                found.append({
+                    "client": label,
+                    "dir_name": dest.name,
+                    "installed_path": str(dest),
+                    "is_symlink": dest.is_symlink(),
+                    "version": ver,
+                })
     return {
         "installed": bool(found),
         "installations": found,
