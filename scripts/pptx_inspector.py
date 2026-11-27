@@ -1257,9 +1257,9 @@ def extract_clean_master_pptx(src_pptx_path: str, out_template_path: str) -> dic
 
 SCENARIO_RULES: list[tuple[re.Pattern[str], str, str, str]] = [
     (re.compile(r"(月会|月例会|周会|周报|例会|进展|同步)"), "sc_progress", "例会与进展汇报", "核心进展与指标 → 问题卡点 → 下一步动作"),
-    (re.compile(r"(复盘|总结|回顾|迭代|运营)"), "sc_review", "项目复盘与迭代", "现状基线与数据证据 → 根因诊断 → 取舍与改进计划"),
+    (re.compile(r"(复盘|总结|回顾|迭代|结项)"), "sc_review", "项目复盘与迭代", "现状基线与数据证据 → 根因诊断 → 取舍与改进计划"),
     (re.compile(r"(方案|立项|评审|规划|启动|架构)"), "sc_proposal", "方案评审与立项", "背景痛点 → 核心方案机制 → 角色落地与收益预期"),
-    (re.compile(r"(客户|提案|宣讲|推介|招商|销售)"), "sc_pitch", "对外客户提案与宣讲", "客户痛点共鸣 → 解决方案与案例证据 → 合作价值"),
+    (re.compile(r"(客户|提案|宣讲|推介|合作|销售)"), "sc_pitch", "对外客户提案与宣讲", "客户痛点共鸣 → 解决方案与案例证据 → 合作价值"),
     (re.compile(r"(培训|分享|答辩|演讲|教学)"), "sc_sharing", "培训分享与答辩", "核心观点开篇 → 原理或案例拆解 → 实操落地清单"),
 ]
 
